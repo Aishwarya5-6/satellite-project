@@ -45,12 +45,13 @@ MAX_LRL_S    = 600.0           # LRL normalisation ceiling          [s]
 C_LIGHT_KM_S = 299_792.458     # Speed of light                     [km s⁻¹]
 
 # ── Reward Hyperparameters ────────────────────────────────────────────────────
-W1       = 0.5    # Latency weight
-W2       = 1.0    # Switching weight
-ETA_S    = 3.0    # PAT setup delay                                [s]
-R_INVALID   = -10.0          # Penalty for selecting a padded slot
-REWARD_MIN  = -10.0          # Clipping floor  (prevents gradient explosion)
-REWARD_MAX  =   0.0          # Clipping ceiling
+W1         = 0.5    # Latency weight
+W2         = 1.0    # Switching weight
+ETA_S      = 3.0    # PAT setup delay                              [s]
+R_INVALID  = -10.0  # Penalty for selecting a padded slot
+R_LRL_DEATH = -50.0 # Penalty for link breakage (LRL → 0 while connected)
+REWARD_MIN = -50.0  # Clipping floor  (widened for LRL death penalty)
+REWARD_MAX =   0.0  # Clipping ceiling
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -58,19 +59,26 @@ class SatelliteEnv(gym.Env):
     """
     Custom Gymnasium environment for stability-aware LEO ISL routing.
 
+    Phase 3.5 Redesign
+    ──────────────────
+    • Slots are **sorted by satellite ID** (not distance).
+    • **LRL Death Penalty** (−50) on link breakage.
+    • **Randomised starting satellite** each episode.
+
     Parameters
     ----------
     topology_path : str | Path
         Path to the ``topology_metadata.json`` produced by Phase 1.
-    current_sat   : int, default 0
-        Satellite node the agent controls.  Can be overridden per episode
+    current_sat   : int, default -1
+        Satellite node the agent controls.  ``-1`` (default) = randomly
+        select a satellite each episode.  Can be overridden per episode
         via ``reset(options={"current_sat": <id>})``.
     render_mode   : str | None
         ``"ansi"`` for a text-based console render; ``None`` to disable.
 
     Observation — shape (12,) float32
     ──────────────────────────────────
-    Slot k  (k = 0 … 3, sorted nearest-first):
+    Slot k  (k = 0 … 3, sorted by **ascending satellite ID**):
         obs[k*3 + 0]  norm_distance  ∈ [0, 1]    dist_km / MAX_ISL_KM
         obs[k*3 + 1]  norm_lrl       ∈ [0, 1]    lrl_s   / MAX_LRL_S
         obs[k*3 + 2]  is_connected   ∈ {0.0, 1.0} 1 if this sat was chosen
@@ -83,15 +91,12 @@ class SatelliteEnv(gym.Env):
 
     Reward
     ──────
-    R = -(w1 · NormLatency  +  w2 · η_s · I_switch),  clipped to [-10, 0]
+    R = -(w1 · NormLatency  +  w2 · η_s · I_switch),  clipped to [-50, 0]
 
-    where:
-        NormLatency = (dist_km / C_LIGHT_KM_S) / (MAX_ISL_KM / C_LIGHT_KM_S)
-                    = dist_km / MAX_ISL_KM               [dimensionless ∈ 0,1]
-        I_switch    = 1 if selected neighbour ≠ previous neighbour, else 0
-        η_s         = 3.0 s   (PAT setup delay)
+    LRL Death Penalty:  if the agent's active link has LRL = 0 at the
+    current timestep (link just broke), reward = -50.0.
 
-    Invalid action (padded slot) → reward = -10.0  (no state advance).
+    Invalid action (padded slot) → reward = -10.0.
     """
 
     metadata = {"render_modes": ["ansi"]}
@@ -103,7 +108,7 @@ class SatelliteEnv(gym.Env):
     def __init__(
         self,
         topology_path: str | Path,
-        current_sat:   int = 0,
+        current_sat:   int = -1,
         render_mode:   Optional[str] = None,
     ) -> None:
         super().__init__()
@@ -188,6 +193,10 @@ class SatelliteEnv(gym.Env):
         """
         Reset the environment to t = 0.
 
+        Phase 3.5:  if ``current_sat == -1`` (default), a **uniformly random**
+        satellite is selected from [0, 59] each episode, forcing the agent to
+        learn a universal routing policy across all orbital geometries.
+
         Parameters
         ----------
         seed : int, optional
@@ -206,10 +215,21 @@ class SatelliteEnv(gym.Env):
         # seeded before any stochastic logic — Gymnasium reproducibility contract
         super().reset(seed=seed)
 
-        self._t           = 0
-        self._current_sat = int((options or {}).get("current_sat", self._default_sat))
-        self._prev_nbr    = -1
-        self._slot_j      = np.full(N_NEIGHBORS, -1, dtype=np.int64)
+        self._t        = 0
+        self._prev_nbr = -1
+        self._slot_j   = np.full(N_NEIGHBORS, -1, dtype=np.int64)
+
+        # ── Satellite selection (Phase 3.5: randomised by default) ────────────
+        opt_sat = (options or {}).get("current_sat", None)
+        if opt_sat is not None:
+            # Explicit override from options dict
+            self._current_sat = int(opt_sat)
+        elif self._default_sat >= 0:
+            # Constructor specified a fixed satellite
+            self._current_sat = self._default_sat
+        else:
+            # Random satellite: uniform draw from [0, N_SATS)
+            self._current_sat = int(self.np_random.integers(0, N_SATS))
 
         obs  = self._get_obs()
         info = {
@@ -228,13 +248,15 @@ class SatelliteEnv(gym.Env):
         """
         Build the (12,) observation vector for the controlled satellite at t.
 
+        Phase 3.5:  neighbours are sorted by **ascending satellite ID**,
+        NOT by distance.  This prevents the agent from exploiting slot
+        ordering as a proxy for latency.
+
         Vectorisation strategy
         ──────────────────────
-        All operations are NumPy array ops (no Python loop over satellites):
-
           Step 1  Slice dist_km[t, i] → (N,) row fetch           O(N)
           Step 2  np.where(connected) → neighbour index array     O(N)
-          Step 3  np.argsort on distance sub-array                O(k log k)
+          Step 3  np.sort on satellite ID (already ascending)     O(k)
           Step 4  Array index: dist[vj] / MAX, lrl[vj] / MAX      O(k)
           Step 5  Broadcast is_connected comparison vj==prev_nbr  O(k)
 
@@ -251,9 +273,11 @@ class SatelliteEnv(gym.Env):
         lrl_row  = self.lrl_s[t, i]            # (N,) float32
         nbr_idx  = np.where(self.connected[t, i])[0]   # indices of live links
 
-        # ── Step 3: sort by ascending distance, keep top-4 ───────────────────
+        # ── Step 3: sort by ascending satellite ID, keep top-4 ───────────────
+        #   Phase 3.5: np.where already returns sorted indices, but we call
+        #   np.sort explicitly for clarity.  Slot 0 = lowest sat ID.
         if nbr_idx.size > 0:
-            nbr_idx = nbr_idx[np.argsort(dist_row[nbr_idx])]  # nearest-first
+            nbr_idx = np.sort(nbr_idx)                        # ID-sorted
             nbr_idx = nbr_idx[:N_NEIGHBORS]                   # top-4
 
         n_valid = nbr_idx.size   # ∈ {0, 1, 2, 3, 4}
@@ -305,14 +329,55 @@ class SatelliteEnv(gym.Env):
         R = -(W1 · NormLatency  +  W2 · ETA_S · I_switch)
 
             NormLatency = dist_km / MAX_ISL_KM   ∈ [0, 1]
-                          (propagation delay / c, normalised by max possible)
             I_switch    = 1 if action changes the active link, else 0
             ETA_S       = 3.0 s  (PAT acquisition delay)
+
+        Phase 3.5 — LRL Death Penalty
+        ──────────────────────────────
+        If the agent's previously-active link has LRL = 0 at the current
+        timestep (the physical link just broke), R = -50.0 regardless
+        of the chosen action.  This forces proactive handovers before
+        link breakage occurs.
         """
         action = int(action)
         t  = self._t
         i  = self._current_sat
         j  = int(self._slot_j[action])      # satellite index (-1 if padded)
+
+        # ── Phase 3.5: LRL Death Penalty ──────────────────────────────────────
+        # If the agent was connected to a neighbour and that link's LRL has
+        # reached 0 at the current timestep, the physical ISL just broke.
+        # Apply a massive penalty to teach proactive switching.
+        lrl_death = False
+        if self._prev_nbr >= 0:
+            prev_lrl = float(self.lrl_s[t, i, self._prev_nbr])
+            if prev_lrl <= 0.0:
+                lrl_death = True
+
+        if lrl_death:
+            self._prev_nbr = -1       # link is broken; no active connection
+            self._t       += 1
+            truncated  = (self._t >= self.T)
+            terminated = False
+            if truncated:
+                obs = self._last_obs.copy()
+            else:
+                obs = self._get_obs()
+                if not self.connected[self._t, i].any():
+                    terminated = True
+            return (
+                obs,
+                R_LRL_DEATH,
+                terminated,
+                truncated,
+                {
+                    "timestep":    self._t,
+                    "current_sat": i,
+                    "event":       "lrl_death_penalty",
+                    "reward":      R_LRL_DEATH,
+                    "broken_link": self._prev_nbr,
+                },
+            )
 
         # ── Guard: invalid action (padded slot) ───────────────────────────────
         # Time always advances (physical reality: 1 second passes regardless).
@@ -458,25 +523,37 @@ def _run_smoke_test(topo_path: Path) -> None:
     DIVIDER = "=" * 68
 
     print(f"\n{DIVIDER}")
-    print("  Phase 2 · SatelliteEnv  —  Smoke Test")
+    print("  Phase 3.5 · SatelliteEnv Redesign  —  Smoke Test")
     print(DIVIDER)
 
-    env = SatelliteEnv(topo_path, current_sat=2, render_mode="ansi")  # sat_02 active from t=0
+    # Use fixed sat for deterministic tests; default (-1) tested separately
+    env = SatelliteEnv(topo_path, current_sat=2, render_mode="ansi")
     print(repr(env))
 
     # ── 1. Reset with seed ────────────────────────────────────────────────────
     print(f"\n{'─'*68}")
-    print("[1/5]  reset(seed=42) …")
+    print("[1/7]  reset(seed=42) …")
     obs, info = env.reset(seed=42)
     print(f"       obs.shape={obs.shape}  obs.dtype={obs.dtype}")
     print(f"       obs (slot 0) : dist={obs[0]:.4f}  lrl={obs[1]:.4f}  "
           f"is_conn={obs[2]:.1f}")
-    print(f"       info         : {info}")
+    print(f"       current_sat  : {info['current_sat']}")
     env.render()
 
-    # ── 2. Step through 15 random actions ────────────────────────────────────
+    # ── 2. Verify ID-sorted slots (Phase 3.5 change #1) ──────────────────────
     print(f"\n{'─'*68}")
-    print("[2/5]  Stepping 15 random actions …")
+    print("[2/7]  ID-sorted slot verification …")
+    obs, _ = env.reset(seed=42)
+    slot_ids = [int(env._slot_j[k]) for k in range(N_NEIGHBORS)
+                if env._slot_j[k] >= 0]
+    is_sorted = all(slot_ids[k] < slot_ids[k+1] for k in range(len(slot_ids)-1))
+    assert is_sorted, f"FAIL: slots not ID-sorted: {slot_ids}"
+    print(f"       Slot satellite IDs: {slot_ids}")
+    print(f"       Ascending order: ✓  (not distance-sorted)")
+
+    # ── 3. Step through 15 random actions ────────────────────────────────────
+    print(f"\n{'─'*68}")
+    print("[3/7]  Stepping 15 random actions …")
     obs, info = env.reset(seed=42)
     cum_reward = 0.0
     print(f"  {'Step':>4}  {'Act':>4}  {'Reward':>8}  {'Dist km':>8}  "
@@ -503,17 +580,17 @@ def _run_smoke_test(topo_path: Path) -> None:
     print(f"\n  Cumulative reward (15 steps): {cum_reward:.4f}")
     env.render()
 
-    # ── 3. Reproducibility ───────────────────────────────────────────────────
+    # ── 4. Reproducibility ───────────────────────────────────────────────────
     print(f"\n{'─'*68}")
-    print("[3/5]  Reproducibility check  (seed=99 × 2 resets) …")
+    print("[4/7]  Reproducibility check  (seed=99 × 2 resets) …")
     obs_a, _ = env.reset(seed=99)
     obs_b, _ = env.reset(seed=99)
     assert np.allclose(obs_a, obs_b), "FAIL: obs differ between identical seeds!"
     print("       Passed ✓  — identical observations for seed=99")
 
-    # ── 4. Invalid-action penalty ─────────────────────────────────────────────
+    # ── 5. Invalid-action penalty ─────────────────────────────────────────────
     print(f"\n{'─'*68}")
-    print("[4/5]  Invalid action penalty test …")
+    print("[5/7]  Invalid action penalty test …")
     obs, _ = env.reset(seed=42)
     obs_2d  = obs.reshape(N_NEIGHBORS, N_FEATURES)
     padded  = np.where(obs_2d[:, 0] < 0.0)[0]   # slots with dist = -1.0
@@ -529,9 +606,23 @@ def _run_smoke_test(topo_path: Path) -> None:
     else:
         print("       All 4 slots filled at t=0 — pad test skipped.")
 
-    # ── 5. Reward clipping ───────────────────────────────────────────────────
+    # ── 6. Randomised satellite selection (Phase 3.5 change #3) ──────────────
     print(f"\n{'─'*68}")
-    print("[5/5]  Reward clipping verification …")
+    print("[6/7]  Randomised satellite selection …")
+    rand_env = SatelliteEnv(topo_path, current_sat=-1, render_mode=None)
+    sat_ids_seen: set[int] = set()
+    for ep_seed in range(20):
+        _, info = rand_env.reset(seed=ep_seed)
+        sat_ids_seen.add(info["current_sat"])
+    rand_env.close()
+    print(f"       20 episodes → {len(sat_ids_seen)} unique sats: "
+          f"{sorted(sat_ids_seen)}")
+    assert len(sat_ids_seen) > 1, "FAIL: all episodes used the same satellite!"
+    print(f"       Randomisation working ✓")
+
+    # ── 7. Reward clipping (updated for Phase 3.5 range) ─────────────────────
+    print(f"\n{'─'*68}")
+    print("[7/7]  Reward clipping verification …")
     obs, _ = env.reset(seed=0)
     rewards = []
     for _ in range(200):
@@ -550,11 +641,10 @@ def _run_smoke_test(topo_path: Path) -> None:
     env.close()
 
     print(f"\n{DIVIDER}")
-    print("  Phase 2  SatelliteEnv — ALL TESTS PASSED ✓")
+    print("  Phase 3.5  SatelliteEnv Redesign — ALL TESTS PASSED ✓")
     print(DIVIDER)
 
 
 if __name__ == "__main__":
     _TOPO = Path(__file__).resolve().parent.parent / "data" / "topology_metadata.json"
-    # sat_02 has an active ISL neighbour (sat_51, ~797 km) from t=0
     _run_smoke_test(_TOPO)
