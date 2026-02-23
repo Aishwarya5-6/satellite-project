@@ -41,8 +41,9 @@ OBS_DIM     = N_NEIGHBORS * N_FEATURES   # 12
 # ── Physical & Constellation Constants ───────────────────────────────────────
 N_SATS       = 60
 MAX_ISL_KM   = 2_000.0        # ISL range threshold                [km]
-MAX_LRL_S    = 600.0           # LRL normalisation ceiling          [s]
-C_LIGHT_KM_S = 299_792.458     # Speed of light                     [km s⁻¹]
+MAX_LRL_S          = 600.0     # Raw LRL ceiling (render only)      [s]
+LRL_HEALTH_HORIZON = 60.0      # Health-bar clip horizon            [s]
+C_LIGHT_KM_S       = 299_792.458  # Speed of light                  [km s⁻¹]
 
 # ── Reward Hyperparameters ────────────────────────────────────────────────────
 W1         = 0.5    # Latency weight
@@ -80,7 +81,7 @@ class SatelliteEnv(gym.Env):
     ──────────────────────────────────
     Slot k  (k = 0 … 3, sorted by **ascending satellite ID**):
         obs[k*3 + 0]  norm_distance  ∈ [0, 1]    dist_km / MAX_ISL_KM
-        obs[k*3 + 1]  norm_lrl       ∈ [0, 1]    lrl_s   / MAX_LRL_S
+        obs[k*3 + 1]  norm_lrl       ∈ [0, 1]    clip(lrl_s, 0, 60) / 60
         obs[k*3 + 2]  is_connected   ∈ {0.0, 1.0} 1 if this sat was chosen
                                                    in the previous step
     Padded (empty) slots: all three features set to -1.0.
@@ -293,7 +294,7 @@ class SatelliteEnv(gym.Env):
         if n_valid > 0:
             vj = nbr_idx                                          # (n_valid,)
             obs[:n_valid, 0] = dist_row[vj] / MAX_ISL_KM         # norm distance ∈ [0,1]
-            obs[:n_valid, 1] = lrl_row[vj]  / MAX_LRL_S          # norm LRL     ∈ [0,1]
+            obs[:n_valid, 1] = np.clip(lrl_row[vj], 0.0, LRL_HEALTH_HORIZON) / LRL_HEALTH_HORIZON  # health-bar ∈ [0,1]
             obs[:n_valid, 2] = (vj == self._prev_nbr).astype(np.float32)  # is_connected
 
         # Cache for step() and render()
@@ -319,7 +320,7 @@ class SatelliteEnv(gym.Env):
         Returns
         -------
         obs        : np.ndarray  (12,)  float32
-        reward     : float       ∈ [-10.0, 0.0]
+        reward     : float       ∈ [-50.0, 0.0]
         terminated : bool        True if satellite is fully isolated
         truncated  : bool        True after T steps (end of orbital period)
         info       : dict        full diagnostic data for logging / analysis
@@ -329,7 +330,8 @@ class SatelliteEnv(gym.Env):
         R = -(W1 · NormLatency  +  W2 · ETA_S · I_switch)
 
             NormLatency = dist_km / MAX_ISL_KM   ∈ [0, 1]
-            I_switch    = 1 if action changes the active link, else 0
+            I_switch    = 1 if target_sat_id ≠ prev_sat_id (physical handover)
+                          0 if same satellite or first connection (_prev_nbr == -1)
             ETA_S       = 3.0 s  (PAT acquisition delay)
 
         Phase 3.5 — LRL Death Penalty
@@ -342,7 +344,7 @@ class SatelliteEnv(gym.Env):
         action = int(action)
         t  = self._t
         i  = self._current_sat
-        j  = int(self._slot_j[action])      # satellite index (-1 if padded)
+        target_sat_id = int(self._slot_j[action])   # physical satellite ID (-1 if padded)
 
         # ── Phase 3.5: LRL Death Penalty ──────────────────────────────────────
         # If the agent was connected to a neighbour and that link's LRL has
@@ -384,7 +386,7 @@ class SatelliteEnv(gym.Env):
         # The -10 penalty teaches the agent to avoid padded slots when valid
         # ones exist; for fully isolated satellites every slot is padded and
         # the penalty still applies, but the episode continues.
-        if j == -1:
+        if target_sat_id == -1:
             self._t   += 1
             truncated  = (self._t >= self.T)
             terminated = False
@@ -408,8 +410,8 @@ class SatelliteEnv(gym.Env):
             )
 
         # ── Reward computation (all NumPy scalar arithmetic) ──────────────────
-        dist_val = float(self.dist_km[t, i, j])
-        lrl_val  = float(self.lrl_s[t, i, j])
+        dist_val = float(self.dist_km[t, i, target_sat_id])
+        lrl_val  = float(self.lrl_s[t, i, target_sat_id])
 
         # Propagation latency, normalised against maximum ISL distance
         #   actual_latency [s] = dist_km / c
@@ -418,15 +420,24 @@ class SatelliteEnv(gym.Env):
         norm_latency = dist_val / MAX_ISL_KM          # ∈ [0, 1]
         latency_ms   = (dist_val / C_LIGHT_KM_S) * 1e3  # for logging
 
-        # PAT switching indicator: 1 = link handover, 0 = link maintained
-        I_switch = 0.0 if (j == self._prev_nbr) else 1.0
+        # PAT switching indicator: based on physical satellite ID, NOT slot
+        # index.  Because slots are ID-sorted, the same satellite can shift
+        # between slots as neighbours drift in/out of range.  Comparing IDs
+        # ensures the agent is only penalised for genuine physical handovers.
+        # First connection of an episode (_prev_nbr == -1) is never a switch.
+        if self._prev_nbr < 0:
+            I_switch = 0.0                             # first connection
+        elif target_sat_id != self._prev_nbr:
+            I_switch = 1.0                             # physical handover
+        else:
+            I_switch = 0.0                             # same satellite
 
         # Core reward (always ≤ 0); clip to prevent gradient explosion on M4
         raw_reward = -(W1 * norm_latency + W2 * ETA_S * I_switch)
         reward     = float(np.clip(raw_reward, REWARD_MIN, REWARD_MAX))
 
         # ── State advance ─────────────────────────────────────────────────────
-        self._prev_nbr = j
+        self._prev_nbr = target_sat_id
         self._t       += 1
 
         truncated  = (self._t >= self.T)
@@ -444,7 +455,7 @@ class SatelliteEnv(gym.Env):
         info = {
             "timestep":       self._t,
             "current_sat":    i,
-            "selected_sat":   j,
+            "selected_sat":   target_sat_id,
             "slot_chosen":    action,
             "dist_km":        round(dist_val, 3),
             "lrl_s":          lrl_val,
@@ -490,7 +501,7 @@ class SatelliteEnv(gym.Env):
                         k,
                         f"s{j:02d}",
                         d * MAX_ISL_KM,
-                        r * MAX_LRL_S,
+                        r * LRL_HEALTH_HORIZON,
                         "yes" if c > 0.5 else "no",
                         flag,
                     )
