@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-Phase 3 — PPO Agent Training
+Phase 3 — PPO Agent Training  (IEEE Submission-Grade)
 ================================================================================
-Research  :  Stability-Aware LEO Routing
-Algorithm :  Proximal Policy Optimisation (PPO)  via Stable-Baselines3
+Research  :  Stability-Aware LEO Routing via Deep Reinforcement Learning
+Algorithm :  Proximal Policy Optimisation (PPO)  via Stable-Baselines3 2.7.1
 Hardware  :  Apple M4 (Metal Performance Shaders — MPS backend)
+Dataset   :  topology_dataset.npz  (86,400 s, J2-perturbed, 5 GS, float16 km)
 
 Pipeline
 ────────
-  1. Instantiate SatelliteEnv for training + separate eval env
-  2. Build PPO(MlpPolicy) on device='mps'
-  3. Train for 1 000 000 timesteps with TensorBoard + EvalCallback
-  4. Run 5 full-orbit evaluation episodes (5 730 steps each)
-  5. Print Average Handover Count  &  Mean Latency
-  6. Save final model → models/stability_ppo_m4.zip
+  1. Validate the .npz dataset exists and detect hardware (MPS / CUDA / CPU)
+  2. Instantiate SatelliteEnv with current_sat=-1 (universal decentralised policy)
+  3. Build PPO(MlpPolicy) with publication hyperparameters
+  4. Confirm training launch interactively, then train for 1,000,000 timesteps
+  5. Run 5 full-orbit evaluation episodes (86,400 steps each)
+  6. Log research metrics: handover jitter, propagation delay,
+     GS network availability, reward stability
+  7. Print LaTeX-ready summary table
 
 Usage
 ─────
@@ -25,33 +28,46 @@ Usage
 
 from __future__ import annotations
 
-import os
 import sys
 import time
 import resource
-import logging
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import torch
 
-# ── Project paths ─────────────────────────────────────────────────────────────
-PROJECT_ROOT   = Path(__file__).resolve().parent.parent
-TOPOLOGY_PATH  = PROJECT_ROOT / "data" / "topology_metadata.json"
-LOG_DIR        = PROJECT_ROOT / "logs"
-MODEL_DIR      = PROJECT_ROOT / "models"
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import (
+    BaseCallback,
+    EvalCallback,
+    CallbackList,
+)
+from stable_baselines3.common.monitor import Monitor
 
-LOG_FILE       = LOG_DIR / "training_output.log"
 
-# Ensure output directories exist
+# ── Project Paths (pathlib only — no os.path) ────────────────────────────────
+PROJECT_ROOT  = Path(__file__).resolve().parent.parent
+TOPOLOGY_PATH = PROJECT_ROOT / "data" / "topology_dataset.npz"
+LOG_DIR       = PROJECT_ROOT / "logs"
+MODEL_DIR     = PROJECT_ROOT / "models"
+LOG_FILE      = LOG_DIR / "training_output.log"
+
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ── Tee Logger: stdout + file simultaneously ─────────────────────────────────
+# ── Ensure SatelliteEnv is importable ─────────────────────────────────────────
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from phase2_gym_environment import SatelliteEnv  # noqa: E402
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# §1  Tee Logger — stdout + file simultaneously
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class TeeLogger:
     """Duplicate all stdout/stderr writes to a log file."""
+
     def __init__(self, filepath: Path) -> None:
         self._terminal = sys.stdout
         self._log = open(filepath, "w", buffering=1)   # line-buffered
@@ -69,21 +85,16 @@ class TeeLogger:
         self._log.close()
 
 
-# ── Ensure SatelliteEnv is importable ─────────────────────────────────────────
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
-from phase2_gym_environment import SatelliteEnv  # noqa: E402
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
-# §1  Hardware Detection
+# §2  Hardware Detection & Validation
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def select_device() -> str:
-    """Select the best available device: MPS → CUDA → CPU."""
+    """Select best accelerator: MPS → CUDA → CPU."""
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        print("  ✓ MPS (Metal Performance Shaders) detected — using Apple M4 GPU")
+        print("  ✓ MPS (Metal Performance Shaders) detected — Apple M4 GPU")
         return "mps"
-    if torch.cuda.is_available():                       # pragma: no cover
+    if torch.cuda.is_available():
         print("  ✓ CUDA GPU detected")
         return "cuda"
     print("  ⚠ No GPU detected — falling back to CPU")
@@ -91,168 +102,314 @@ def select_device() -> str:
 
 
 def validate_hardware(device: str) -> None:
-    """
-    Run a quick tensor computation on the selected device to confirm
-    it is functional, then report MPS driver memory.
-    """
+    """Quick compute + memory smoke test on the target device."""
     print("  Hardware validation:")
-    print(f"    PyTorch        : {torch.__version__}")
-    print(f"    Device         : {device}")
+    print(f"    PyTorch          : {torch.__version__}")
+    print(f"    Device           : {device}")
 
-    # Smoke test: matmul on the target device
     a = torch.randn(256, 256, device=device)
-    b = torch.randn(256, 256, device=device)
-    c = a @ b
-    assert c.shape == (256, 256), "matmul sanity check failed"
-    print(f"    Matmul (256×256): ✓  on {c.device}")
+    c = a @ a.T
+    assert c.shape == (256, 256)
+    print(f"    Matmul (256×256) : ✓  on {c.device}")
 
     if device == "mps":
-        alloc = torch.mps.current_allocated_memory() / 1e6
+        alloc  = torch.mps.current_allocated_memory() / 1e6
         driver = torch.mps.driver_allocated_memory() / 1e6
-        print(f"    MPS allocated  : {alloc:8.2f} MB")
-        print(f"    MPS driver     : {driver:8.2f} MB")
+        print(f"    MPS allocated    : {alloc:8.2f} MB")
+        print(f"    MPS driver       : {driver:8.2f} MB")
 
-    # System RAM via rusage
     ru = resource.getrusage(resource.RUSAGE_SELF)
-    rss_mb = ru.ru_maxrss / (1024 * 1024)  # macOS reports in bytes
-    print(f"    System RSS     : {rss_mb:8.1f} MB")
+    rss_mb = ru.ru_maxrss / (1024 * 1024)
+    print(f"    System RSS       : {rss_mb:8.1f} MB")
     print()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# §2  Environment Factory
+# §3  Environment Factory
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def make_env(sat_id: int = 2, seed: int = 42) -> SatelliteEnv:
+def make_env(sat_id: int = -1, seed: int | None = None) -> SatelliteEnv:
     """
-    Create a SatelliteEnv instance.
+    Create a SatelliteEnv.
 
-    Uses sat_02 by default because it has active ISL neighbours at t = 0,
-    providing a non-trivial starting state (verified in Phase 2 smoke tests).
+    Default ``current_sat=-1``  →  random satellite each episode, which is
+    **critical** for claiming a universal decentralised policy in the paper.
     """
+    if not TOPOLOGY_PATH.exists():
+        raise FileNotFoundError(
+            f"Dataset not found: {TOPOLOGY_PATH}\n"
+            f"Run  python src/phase1_environment_modeling.py  first."
+        )
+
     env = SatelliteEnv(
-        topology_path=str(TOPOLOGY_PATH),
+        topology_path=TOPOLOGY_PATH,
         current_sat=sat_id,
         render_mode=None,
     )
-    env.reset(seed=seed)
+    if seed is not None:
+        env.reset(seed=seed)
     return env
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# §3  Hardware Monitor Callback
+# §4  Hardware Monitor Callback
 # ═══════════════════════════════════════════════════════════════════════════════
-
-from stable_baselines3.common.callbacks import BaseCallback
-
 
 class HardwareMonitorCallback(BaseCallback):
     """
-    SB3 callback that logs hardware telemetry every *log_freq* training
-    steps.  Reported metrics:
+    SB3 callback that logs hardware telemetry every ``log_freq`` steps.
 
-        • wall-clock throughput   (steps / s)
-        • MPS allocated memory    (MB)   — Apple Silicon only
-        • MPS driver memory       (MB)
-        • System RSS              (MB)
+    Logged metrics (for the "Computational Efficiency" subsection):
+        • Steps Per Second (FPS)
+        • MPS Allocated Memory (MB)   — Apple Silicon only
+        • System RSS (MB)
     """
 
     def __init__(self, log_freq: int = 20_000, device: str = "cpu") -> None:
         super().__init__(verbose=0)
-        self.log_freq    = log_freq
-        self.hw_device   = device
-        self._t0         = time.perf_counter()
-        self._last_step  = 0
-        self._last_time  = 0.0
+        self.log_freq  = log_freq
+        self.hw_device = device
+        self._t0       = time.perf_counter()
+        self._prev_step = 0
+        self._prev_time = 0.0
 
     def _on_step(self) -> bool:
         if self.num_timesteps % self.log_freq != 0:
             return True
 
         now     = time.perf_counter()
-        elapsed = now - self._t0
-        delta   = self.num_timesteps - self._last_step
-        rate    = delta / max(elapsed - self._last_time, 1e-9)
+        wall    = now - self._t0
+        delta_s = wall - self._prev_time
+        delta_n = self.num_timesteps - self._prev_step
+        fps     = delta_n / max(delta_s, 1e-9)
 
         parts = [
             f"  ⏱  step {self.num_timesteps:>9,}",
-            f"throughput {rate:7.0f} stp/s",
+            f"FPS {fps:7.0f}",
         ]
 
         if self.hw_device == "mps":
-            alloc  = torch.mps.current_allocated_memory() / 1e6
-            driver = torch.mps.driver_allocated_memory() / 1e6
-            parts.append(f"MPS alloc {alloc:6.1f} MB")
-            parts.append(f"MPS driver {driver:6.1f} MB")
+            mps_mb = torch.mps.current_allocated_memory() / 1e6
+            parts.append(f"MPS alloc {mps_mb:6.1f} MB")
 
         ru = resource.getrusage(resource.RUSAGE_SELF)
         rss_mb = ru.ru_maxrss / (1024 * 1024)
-        parts.append(f"RSS {rss_mb:6.1f} MB")
+        parts.append(f"RSS {rss_mb:6.0f} MB")
 
         print("  │  ".join(parts))
 
-        self._last_step = self.num_timesteps
-        self._last_time = elapsed
+        # TensorBoard scalars
+        self.logger.record("hw/fps",       fps)
+        self.logger.record("hw/rss_mb",    rss_mb)
+        if self.hw_device == "mps":
+            self.logger.record("hw/mps_alloc_mb",
+                               torch.mps.current_allocated_memory() / 1e6)
+
+        self._prev_step = self.num_timesteps
+        self._prev_time = wall
         return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# §4  PPO Training
+# §5  Post-Training Evaluation  (research-grade)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def evaluate(model: PPO, n_episodes: int = 5) -> dict:
+    """
+    Run ``n_episodes`` full 24-h orbit evaluations (86,400 steps each).
+
+    Research Metrics  (IEEE table-ready)
+    ─────────────────
+    1. Handover Jitter       :  total link switches  (I_switch = 1)
+    2. Propagation Delay     :  mean one-hop latency [ms]
+    3. GS Network Availability:  % of timesteps with ≥1 visible ground station
+    4. Reward Stability      :  mean ± σ of episode return
+    5. LRL Death Events      :  count of link-breakage penalties
+    6. Invalid Actions       :  count of padded-slot selections
+    """
+    print("─" * 72)
+    print("  Post-Training Evaluation  —  5 full-orbit episodes (86,400 s each)")
+    print("─" * 72)
+
+    eval_env = make_env(sat_id=-1)   # random satellite per episode
+
+    ep_handovers:  list[int]   = []
+    ep_latencies:  list[float] = []
+    ep_returns:    list[float] = []
+    ep_gs_avail:   list[float] = []
+    ep_deaths:     list[int]   = []
+    ep_invalids:   list[int]   = []
+
+    for ep in range(n_episodes):
+        obs, info = eval_env.reset(seed=ep + 1000)
+        sat_id = info["current_sat"]
+
+        handovers   = 0
+        latencies:  list[float] = []
+        ep_return   = 0.0
+        gs_visible  = 0           # timesteps with ≥1 ground station
+        total_steps = 0
+        deaths      = 0
+        invalids    = 0
+        done        = False
+
+        # Count initial timestep GS visibility
+        if len(info.get("visible_gs", [])) > 0:
+            gs_visible += 1
+        total_steps += 1
+
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, info = eval_env.step(int(action))
+            done = terminated or truncated
+
+            ep_return   += reward
+            total_steps += 1
+
+            event = info.get("event", "")
+            if event == "lrl_death_penalty":
+                deaths += 1
+            elif event == "invalid_action_penalty":
+                invalids += 1
+            else:
+                handovers += info.get("I_switch", 0)
+                lat = info.get("latency_ms", 0.0)
+                if lat > 0:
+                    latencies.append(lat)
+
+            if len(info.get("visible_gs", [])) > 0:
+                gs_visible += 1
+
+        mean_lat   = float(np.mean(latencies)) if latencies else 0.0
+        gs_pct     = 100.0 * gs_visible / max(total_steps, 1)
+
+        ep_handovers.append(handovers)
+        ep_latencies.append(mean_lat)
+        ep_returns.append(ep_return)
+        ep_gs_avail.append(gs_pct)
+        ep_deaths.append(deaths)
+        ep_invalids.append(invalids)
+
+        print(f"    Ep {ep+1}/{n_episodes}  sat_{sat_id:02d}  │  "
+              f"HO: {handovers:5d}  │  "
+              f"Lat: {mean_lat:6.3f} ms  │  "
+              f"GS: {gs_pct:5.1f}%  │  "
+              f"Return: {ep_return:10.2f}  │  "
+              f"Deaths: {deaths:4d}  │  "
+              f"Invalid: {invalids:4d}")
+
+    eval_env.close()
+
+    # ── Aggregate ─────────────────────────────────────────────────────────────
+    results = {
+        "handover_mean":   float(np.mean(ep_handovers)),
+        "handover_std":    float(np.std(ep_handovers)),
+        "latency_mean_ms": float(np.mean(ep_latencies)),
+        "latency_std_ms":  float(np.std(ep_latencies)),
+        "gs_avail_mean":   float(np.mean(ep_gs_avail)),
+        "gs_avail_std":    float(np.std(ep_gs_avail)),
+        "return_mean":     float(np.mean(ep_returns)),
+        "return_std":      float(np.std(ep_returns)),
+        "deaths_mean":     float(np.mean(ep_deaths)),
+        "invalids_mean":   float(np.mean(ep_invalids)),
+    }
+
+    # ── LaTeX-ready summary table ─────────────────────────────────────────────
+    W = 72
+    print()
+    print("=" * W)
+    print("  EVALUATION RESULTS  —  Research Metrics for IEEE Submission")
+    print("=" * W)
+    print(f"  {'Metric':<40s} {'Value':>28s}")
+    print(f"  {'─'*40} {'─'*28}")
+    print(f"  {'Handover Jitter (switches/ep)':<40s} "
+          f"{results['handover_mean']:10.1f} ± {results['handover_std']:.1f}")
+    print(f"  {'Mean Propagation Delay [ms]':<40s} "
+          f"{results['latency_mean_ms']:10.4f} ± {results['latency_std_ms']:.4f}")
+    print(f"  {'GS Network Availability [%]':<40s} "
+          f"{results['gs_avail_mean']:10.2f} ± {results['gs_avail_std']:.2f}")
+    print(f"  {'Mean Episode Return':<40s} "
+          f"{results['return_mean']:10.2f} ± {results['return_std']:.2f}")
+    print(f"  {'Reward Stability (σ of return)':<40s} "
+          f"{results['return_std']:10.2f}")
+    print(f"  {'LRL Death Events / episode':<40s} "
+          f"{results['deaths_mean']:10.1f}")
+    print(f"  {'Invalid Actions / episode':<40s} "
+          f"{results['invalids_mean']:10.1f}")
+    print(f"  {'─'*40} {'─'*28}")
+    print(f"  {'Episodes':<40s} {n_episodes:>28d}")
+    print(f"  {'Steps / episode':<40s} {'86,400':>28s}")
+    print(f"  {'Policy':<40s} {'universal (current_sat=-1)':>28s}")
+    print("=" * W)
+    print()
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# §6  PPO Training Pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Training Hyperparameters ──────────────────────────────────────────────────
+TOTAL_TIMESTEPS = 1_000_000
+LR              = 3e-4
+N_STEPS         = 2048
+BATCH_SIZE      = 64
+GAMMA           = 0.99
+ENT_COEF        = 0.01          # encourage exploration over 24 h orbit
+
+
 def train() -> None:
-    """Run full PPO training pipeline."""
-    from stable_baselines3 import PPO
-    from stable_baselines3.common.callbacks import EvalCallback, CallbackList
-    from stable_baselines3.common.monitor import Monitor
+    """Run full PPO training pipeline with research-grade logging."""
 
     # ── 0. Tee all output to log file ────────────────────────────────────────
     tee = TeeLogger(LOG_FILE)
-    sys.stdout = tee  # type: ignore[assignment]
-    sys.stderr = tee  # type: ignore[assignment]
+    sys.stdout = tee   # type: ignore[assignment]
+    sys.stderr = tee   # type: ignore[assignment]
 
-    print("=" * 72)
-    print("  Phase 3 — PPO Agent Training")
-    print(f"  Started : {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  Log file: {LOG_FILE}")
-    print("=" * 72)
+    DIVIDER = "=" * 72
+    print(DIVIDER)
+    print("  Phase 3 — PPO Agent Training  (IEEE Submission-Grade)")
+    print(f"  Started   : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Dataset   : {TOPOLOGY_PATH.name}  "
+          f"({TOPOLOGY_PATH.stat().st_size / 1e6:.1f} MB)")
+    print(f"  Log file  : {LOG_FILE}")
+    print(DIVIDER)
 
-    # ── 1. Device ─────────────────────────────────────────────────────────────
+    # ── 1. Hardware ───────────────────────────────────────────────────────────
     device = select_device()
     validate_hardware(device)
 
-    # ── 2. Environments ──────────────────────────────────────────────────────
-    print("  Building training environment …")
-    train_env = Monitor(make_env(sat_id=2, seed=42))
+    # ── 2. Environments (current_sat=-1 → universal decentralised policy) ────
+    print("  Building training environment   (current_sat=-1, randomised) …")
+    train_env = Monitor(make_env(sat_id=-1, seed=42))
 
-    print("  Building evaluation environment …")
-    eval_env  = Monitor(make_env(sat_id=2, seed=99))
+    print("  Building evaluation environment (current_sat=-1, randomised) …")
+    eval_env  = Monitor(make_env(sat_id=-1, seed=99))
     print()
 
-    # ── 3. PPO Agent ──────────────────────────────────────────────────────────
-    TOTAL_TIMESTEPS = 1_000_000
-    LR       = 3e-4
-    N_STEPS  = 2048
-    BATCH    = 64
-    GAMMA    = 0.99
-    ENT_COEF = 0.01
-
-    print("  Hyperparameters:")
-    print(f"    {'learning_rate':20s} = {LR}")
-    print(f"    {'n_steps':20s} = {N_STEPS}")
-    print(f"    {'batch_size':20s} = {BATCH}")
-    print(f"    {'gamma':20s} = {GAMMA}")
-    print(f"    {'ent_coef':20s} = {ENT_COEF}")
-    print(f"    {'total_timesteps':20s} = {TOTAL_TIMESTEPS:,}")
-    print(f"    {'device':20s} = {device}")
+    # ── 3. Print hyperparameters ──────────────────────────────────────────────
+    print("  Hyperparameters")
+    print("  ┌─────────────────────────────────────────┐")
+    print(f"  │  {'learning_rate':20s} = {LR:<18}│")
+    print(f"  │  {'n_steps':20s} = {N_STEPS:<18}│")
+    print(f"  │  {'batch_size':20s} = {BATCH_SIZE:<18}│")
+    print(f"  │  {'gamma':20s} = {GAMMA:<18}│")
+    print(f"  │  {'ent_coef':20s} = {ENT_COEF:<18}│")
+    print(f"  │  {'total_timesteps':20s} = {TOTAL_TIMESTEPS:<18,}│")
+    print(f"  │  {'device':20s} = {device:<18}│")
+    print(f"  │  {'policy':20s} = {'MlpPolicy':<18}│")
+    print(f"  │  {'current_sat':20s} = {'-1 (random)':<18}│")
+    print("  └─────────────────────────────────────────┘")
     print()
 
+    # ── 4. Build PPO model ────────────────────────────────────────────────────
     model = PPO(
         policy="MlpPolicy",
         env=train_env,
         learning_rate=LR,
         n_steps=N_STEPS,
-        batch_size=BATCH,
+        batch_size=BATCH_SIZE,
         gamma=GAMMA,
         ent_coef=ENT_COEF,
         verbose=1,
@@ -261,22 +418,34 @@ def train() -> None:
         seed=42,
     )
 
-    # ── 4. Callbacks ──────────────────────────────────────────────────────────
+    # ── 5. Callbacks ──────────────────────────────────────────────────────────
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path=str(MODEL_DIR),
         log_path=str(LOG_DIR),
-        eval_freq=10_000,              # evaluate every 10 000 training steps
+        eval_freq=10_000,
         n_eval_episodes=5,
         deterministic=True,
         verbose=1,
     )
-
     hw_callback = HardwareMonitorCallback(log_freq=20_000, device=device)
     callbacks   = CallbackList([eval_callback, hw_callback])
 
-    # ── 5. Training ───────────────────────────────────────────────────────────
-    print("  Training started …")
+    # ── 6. Interactive confirmation ───────────────────────────────────────────
+    print("─" * 72)
+    print(f"  Ready to train for {TOTAL_TIMESTEPS:,} timesteps.")
+    print(f"  Estimated time: ~60-90 min on Apple M4.")
+    print("─" * 72)
+
+    # Restore real stdin for input prompt (TeeLogger only wraps stdout)
+    saved_stdout    = sys.stdout
+    sys.stdout      = tee._terminal   # type: ignore[assignment]
+    confirm = input("  Press ENTER to start training (or Ctrl-C to abort): ")
+    sys.stdout      = saved_stdout    # type: ignore[assignment]
+
+    print(f"  ✓ Confirmed — launching training loop\n")
+
+    # ── 7. Train ──────────────────────────────────────────────────────────────
     t0 = time.perf_counter()
 
     model.learn(
@@ -286,123 +455,45 @@ def train() -> None:
     )
 
     elapsed = time.perf_counter() - t0
-    print(f"\n  Training complete — {elapsed:.1f}s  "
-          f"({TOTAL_TIMESTEPS/elapsed:.0f} steps/s)")
-    print(f"  Wall-clock throughput: {TOTAL_TIMESTEPS/elapsed:,.0f} steps/s")
-    print()
+    avg_fps = TOTAL_TIMESTEPS / max(elapsed, 1e-9)
+    print(f"\n  Training complete — {elapsed:.1f} s  ({avg_fps:,.0f} steps/s)")
 
-    # ── 6. Save final model ───────────────────────────────────────────────────
+    # ── 8. Save final model ───────────────────────────────────────────────────
     final_path = MODEL_DIR / "stability_ppo_m4"
     model.save(str(final_path))
-    print(f"  ✓ Final model saved → {final_path}.zip")
-    print()
+    print(f"  ✓ Final model saved → {final_path}.zip\n")
 
-    # ── 7. Post-training evaluation: 5 full orbits ───────────────────────────
-    evaluate(model, device)
+    # ── 9. Post-training evaluation (5 × 86,400-step episodes) ────────────────
+    results = evaluate(model, n_episodes=5)
 
-    # ── 8. Final hardware report ──────────────────────────────────────────────
+    # ── 10. Final hardware report ─────────────────────────────────────────────
+    print("  Final Hardware State")
     if device == "mps":
         alloc  = torch.mps.current_allocated_memory() / 1e6
         driver = torch.mps.driver_allocated_memory() / 1e6
-        print(f"  Final MPS allocated : {alloc:.2f} MB")
-        print(f"  Final MPS driver    : {driver:.2f} MB")
+        print(f"    MPS allocated  : {alloc:.2f} MB")
+        print(f"    MPS driver     : {driver:.2f} MB")
     ru = resource.getrusage(resource.RUSAGE_SELF)
     rss_mb = ru.ru_maxrss / (1024 * 1024)
-    print(f"  Peak system RSS     : {rss_mb:.1f} MB")
-    print(f"  Finished : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"    Peak system RSS: {rss_mb:.1f} MB")
+    print(f"    Training FPS   : {avg_fps:,.0f} steps/s")
+    print(f"    Wall-clock     : {elapsed:.1f} s  ({elapsed/60:.1f} min)")
+    print(f"    Finished       : {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print()
 
-    # Cleanup
+    # ── Cleanup ───────────────────────────────────────────────────────────────
     train_env.close()
     eval_env.close()
 
-    # Restore stdout
-    sys.stdout = tee._terminal  # type: ignore[assignment]
-    sys.stderr = tee._terminal  # type: ignore[assignment]
+    sys.stdout = tee._terminal   # type: ignore[assignment]
+    sys.stderr = tee._terminal   # type: ignore[assignment]
     tee.close()
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# §5  Post-Training Evaluation
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def evaluate(model, device: str, n_episodes: int = 5) -> None:
-    """
-    Run *n_episodes* full-orbit test episodes (5 730 steps each).
-
-    Metrics
-    ───────
-    - Average Handover Count  :  total link switches across all steps
-    - Mean Latency (ms)       :  average propagation delay per step
-    """
-    from stable_baselines3 import PPO
-
-    print("─" * 72)
-    print("  Post-Training Evaluation  —  5 full-orbit episodes")
-    print("─" * 72)
-
-    eval_env = SatelliteEnv(
-        topology_path=str(TOPOLOGY_PATH),
-        current_sat=2,
-        render_mode=None,
-    )
-
-    all_handovers:  list[int]   = []
-    all_latencies:  list[float] = []
-    all_rewards:    list[float] = []
-    all_invalid:    list[int]   = []
-
-    for ep in range(n_episodes):
-        obs, info = eval_env.reset(seed=ep + 1000)
-
-        ep_handovers  = 0
-        ep_latencies: list[float] = []
-        ep_reward     = 0.0
-        ep_invalid    = 0
-        done          = False
-
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = eval_env.step(int(action))
-            done = terminated or truncated
-
-            ep_reward += reward
-
-            if info.get("event") == "invalid_action_penalty":
-                ep_invalid += 1
-            else:
-                ep_handovers += info.get("I_switch", 0)
-                lat = info.get("latency_ms", 0.0)
-                if lat > 0:
-                    ep_latencies.append(lat)
-
-        mean_lat = np.mean(ep_latencies) if ep_latencies else 0.0
-        all_handovers.append(ep_handovers)
-        all_latencies.append(float(mean_lat))
-        all_rewards.append(ep_reward)
-        all_invalid.append(ep_invalid)
-
-        print(f"    Episode {ep+1}/{n_episodes}  │  "
-              f"Handovers: {ep_handovers:5d}  │  "
-              f"Mean Latency: {mean_lat:7.4f} ms  │  "
-              f"Return: {ep_reward:9.2f}  │  "
-              f"Invalid: {ep_invalid}")
-
-    eval_env.close()
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    print()
-    print("  ┌──────────────────────────────────────────────────────────┐")
-    print(f"  │  Average Handover Count : {np.mean(all_handovers):10.1f}            │")
-    print(f"  │  Mean Latency (ms)      : {np.mean(all_latencies):10.4f}            │")
-    print(f"  │  Mean Episode Return    : {np.mean(all_rewards):10.2f}            │")
-    print(f"  │  Mean Invalid Actions   : {np.mean(all_invalid):10.1f}            │")
-    print("  └──────────────────────────────────────────────────────────┘")
-    print()
+    print(f"  Log saved → {LOG_FILE}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# §6  Entry Point
+# §7  Entry Point
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":

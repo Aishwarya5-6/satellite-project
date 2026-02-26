@@ -26,7 +26,6 @@ Reward             :  R = -(w1·NormLatency + w2·η_s·I_switch)  ∈ [-10, 0]
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Optional, cast
 
@@ -69,7 +68,7 @@ class SatelliteEnv(gym.Env):
     Parameters
     ----------
     topology_path : str | Path
-        Path to the ``topology_metadata.json`` produced by Phase 1.
+        Path to the ``topology_dataset.npz`` produced by Phase 1.
     current_sat   : int, default -1
         Satellite node the agent controls.  ``-1`` (default) = randomly
         select a satellite each episode.  Can be overridden per episode
@@ -143,7 +142,7 @@ class SatelliteEnv(gym.Env):
 
     def _load_topology(self) -> None:
         """
-        Parse topology_metadata.json and build three dense NumPy arrays.
+        Load topology_dataset.npz and build dense NumPy arrays.
 
         Arrays
         ──────
@@ -151,39 +150,72 @@ class SatelliteEnv(gym.Env):
         lrl_s     : (T, N, N)  float32  link residual lifetime in seconds
         connected : (T, N, N)  bool     True where an active ISL exists
         timestamps: (T,)       int32    epoch second for each timestep index
+        gsl_masks : dict[str, (T, N) bool]  per ground station visibility
         """
+        if not self._topology_path.exists():
+            raise FileNotFoundError(
+                f"Dataset not found: {self._topology_path}\n"
+                f"Run src/phase1_environment_modeling.py first to generate it."
+            )
+
         print(f"  [Phase 2] Loading topology: {self._topology_path.name} …",
               end=" ", flush=True)
 
-        with open(self._topology_path, "r") as fh:
-            raw: dict = json.load(fh)
+        data = np.load(self._topology_path, allow_pickle=False)
 
-        # Sort timestamps numerically to guarantee consistent ordering
-        sorted_keys = sorted(int(k) for k in raw.keys())
-        self.T          = len(sorted_keys)
-        self.timestamps = np.array(sorted_keys, dtype=np.int32)
+        self.timestamps = data["timestamps"]                         # (T,) int32
+        self.T          = int(self.timestamps.shape[0])
 
-        # Pre-allocate dense (T, N, N) tensors — float32 to halve memory
-        self.dist_km = np.zeros((self.T, N_SATS, N_SATS), dtype=np.float32)
-        self.lrl_s   = np.zeros((self.T, N_SATS, N_SATS), dtype=np.float32)
+        # isl_distances is stored as float16 (km) — cast to float32 immediately
+        # so all reward arithmetic is done in full precision.
+        self.dist_km   = data["isl_distances"].astype(np.float32)   # (T, N, N) km
+        self.lrl_s     = data["isl_lifetimes"].astype(np.float32)   # (T, N, N) s
+        # Use lrl_s > 0 (not dist_km > 0) as the canonical connectivity mask.
+        # This is robust against Phase 1 datasets that store distances for all
+        # pairs: a link is active iff its residual lifetime is positive.
+        self.connected = self.lrl_s > 0                             # (T, N, N) bool
 
-        # Populate from JSON  (inner loop is unavoidable for JSON parsing but
-        # array assignments are vectorised and avoid per-cell Python overhead)
-        for t_idx, t_key in enumerate(sorted_keys):
-            for sat_str, nbrs in raw[str(t_key)].items():
-                i = int(sat_str[4:])          # "sat_XX" → int
-                for nbr_str, link in nbrs.items():
-                    j = int(nbr_str[4:])
-                    self.dist_km[t_idx, i, j] = link["distance_km"]
-                    self.lrl_s[t_idx, i, j]   = link["residual_lifetime_s"]
-
-        self.connected = self.dist_km > 0.0   # (T, N, N) bool
+        # Ground station visibility masks: {city_name: (T, N) bool}
+        self.gsl_masks: dict[str, np.ndarray] = {}
+        for key in data.files:
+            if key.startswith("gsl_"):
+                city = key[4:]                   # strip "gsl_" prefix
+                self.gsl_masks[city] = data[key] # (T, N) bool
 
         print(f"done.  T={self.T} steps, N={N_SATS} sats, "
+              f"{len(self.gsl_masks)} ground stations, "
               f"peak RAM≈{self.dist_km.nbytes*2/1e6:.0f} MB")
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 3 · Gymnasium Core API
+    # 3 · Info Builder
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _get_info(self, t: int, i: int, **extra) -> dict:
+        """
+        Build the step/reset info dict for timestep ``t``, satellite ``i``.
+
+        Always includes:
+          ``timestep``    – current timestep index
+          ``current_sat`` – controlled satellite ID
+          ``visible_gs``  – list of cities with line-of-sight to satellite ``i``
+                            at timestep ``t`` (elevation ≥ 25°)
+
+        Any additional keyword arguments are merged in (e.g. reward, event).
+        """
+        visible_gs = [
+            city for city, mask in self.gsl_masks.items()
+            if mask[t, i]
+        ]
+        info: dict = {
+            "timestep":    t,
+            "current_sat": i,
+            "visible_gs":  visible_gs,
+        }
+        info.update(extra)
+        return info
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 4 · Gymnasium Core API
     # ──────────────────────────────────────────────────────────────────────────
 
     def reset(
@@ -233,12 +265,11 @@ class SatelliteEnv(gym.Env):
             self._current_sat = int(self.np_random.integers(0, N_SATS))
 
         obs  = self._get_obs()
-        info = {
-            "timestep":    0,
-            "current_sat": self._current_sat,
-            "T_total":     self.T,
-            "seed":        seed,
-        }
+        info = self._get_info(
+            0, self._current_sat,
+            T_total=self.T,
+            seed=seed,
+        )
         return obs, info
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -372,13 +403,12 @@ class SatelliteEnv(gym.Env):
                 R_LRL_DEATH,
                 terminated,
                 truncated,
-                {
-                    "timestep":    self._t,
-                    "current_sat": i,
-                    "event":       "lrl_death_penalty",
-                    "reward":      R_LRL_DEATH,
-                    "broken_link": self._prev_nbr,
-                },
+                self._get_info(
+                    self._t, i,
+                    event="lrl_death_penalty",
+                    reward=R_LRL_DEATH,
+                    broken_link=self._prev_nbr,
+                ),
             )
 
         # ── Guard: invalid action (padded slot) ───────────────────────────────
@@ -401,12 +431,11 @@ class SatelliteEnv(gym.Env):
                 R_INVALID,
                 terminated,
                 truncated,
-                {
-                    "timestep":    self._t,
-                    "current_sat": i,
-                    "event":       "invalid_action_penalty",
-                    "reward":      R_INVALID,
-                },
+                self._get_info(
+                    self._t, i,
+                    event="invalid_action_penalty",
+                    reward=R_INVALID,
+                ),
             )
 
         # ── Reward computation (all NumPy scalar arithmetic) ──────────────────
@@ -452,19 +481,18 @@ class SatelliteEnv(gym.Env):
                 terminated = True
 
         # ── Diagnostics ───────────────────────────────────────────────────────
-        info = {
-            "timestep":       self._t,
-            "current_sat":    i,
-            "selected_sat":   target_sat_id,
-            "slot_chosen":    action,
-            "dist_km":        round(dist_val, 3),
-            "lrl_s":          lrl_val,
-            "latency_ms":     round(latency_ms, 4),
-            "norm_latency":   round(norm_latency, 6),
-            "I_switch":       int(I_switch),
-            "raw_reward":     round(raw_reward, 6),
-            "reward":         reward,
-        }
+        info = self._get_info(
+            self._t, i,
+            selected_sat=target_sat_id,
+            slot_chosen=action,
+            dist_km=round(dist_val, 3),
+            lrl_s=lrl_val,
+            latency_ms=round(latency_ms, 4),
+            norm_latency=round(norm_latency, 6),
+            I_switch=int(I_switch),
+            raw_reward=round(raw_reward, 6),
+            reward=reward,
+        )
         return obs, reward, terminated, truncated, info
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -534,7 +562,7 @@ def _run_smoke_test(topo_path: Path) -> None:
     DIVIDER = "=" * 68
 
     print(f"\n{DIVIDER}")
-    print("  Phase 3.5 · SatelliteEnv Redesign  —  Smoke Test")
+    print("  Phase 2 · SatelliteEnv (NPZ)  —  Smoke Test")
     print(DIVIDER)
 
     # Use fixed sat for deterministic tests; default (-1) tested separately
@@ -549,6 +577,7 @@ def _run_smoke_test(topo_path: Path) -> None:
     print(f"       obs (slot 0) : dist={obs[0]:.4f}  lrl={obs[1]:.4f}  "
           f"is_conn={obs[2]:.1f}")
     print(f"       current_sat  : {info['current_sat']}")
+    print(f"       visible_gs   : {info['visible_gs']}")
     env.render()
 
     # ── 2. Verify ID-sorted slots (Phase 3.5 change #1) ──────────────────────
@@ -652,10 +681,10 @@ def _run_smoke_test(topo_path: Path) -> None:
     env.close()
 
     print(f"\n{DIVIDER}")
-    print("  Phase 3.5  SatelliteEnv Redesign — ALL TESTS PASSED ✓")
+    print("  Phase 2  SatelliteEnv (NPZ) — ALL TESTS PASSED ✓")
     print(DIVIDER)
 
 
 if __name__ == "__main__":
-    _TOPO = Path(__file__).resolve().parent.parent / "data" / "topology_metadata.json"
+    _TOPO = Path(__file__).resolve().parent.parent / "data" / "topology_dataset.npz"
     _run_smoke_test(_TOPO)
