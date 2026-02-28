@@ -62,7 +62,7 @@ N_PER_PLANE      = N_TOTAL // N_PLANES # Satellites per plane  = 12
 F_PHASING        = 1                   # Walker phasing parameter
 
 # ── ISL Connectivity ─────────────────────────────────────────────────────────
-ISL_THRESHOLD_M  = 2_000_000.0         # Max ISL range  [m]  (= 2,000 km)
+# ISL_THRESHOLD_M is computed dynamically after SMA is defined (see below).
 
 # ── Ground Stations (GSL) ────────────────────────────────────────────────────
 #   { name: (latitude_deg, longitude_deg) }  — East-positive longitudes
@@ -98,6 +98,14 @@ T_SIM         = 86_400                                         # [s]  (24 h)
 
 # Maximum chord distance guaranteed line-of-sight above Earth's surface:
 MAX_LOS_M     = 2.0 * np.sqrt(SMA**2 - R_EARTH**2)
+
+# Dynamic ISL threshold — based on intra-plane nearest-neighbour chord length.
+# For a Walker constellation with N_PER_PLANE equally-spaced satellites per
+# plane at semi-major axis SMA, the angular separation is 2π/N_PER_PLANE and
+# the chord distance is 2·SMA·sin(θ/2).  A 10 % margin accommodates J2 drift.
+_INTRA_PLANE_ANGLE = 2.0 * np.pi / N_PER_PLANE           # [rad]
+_CHORD_M           = 2.0 * SMA * np.sin(_INTRA_PLANE_ANGLE / 2.0)  # [m]
+ISL_THRESHOLD_M    = min(_CHORD_M * 1.10, MAX_LOS_M)     # [m]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -439,6 +447,7 @@ def export_topology_npz(output_path: Path,
         "timestamps":    timestamps.astype(np.int32),
         "isl_distances": ((dist_matrix_m / 1000.0) * connected_mask).astype(np.float16),  # m → km, float16; 0 = no link
         "isl_lifetimes": lifetime_matrix.astype(np.int32),
+        "isl_threshold_km": np.array(ISL_THRESHOLD_M / 1000.0, dtype=np.float32),
     }
     for gs_name, mask in gsl_masks.items():
         arrays[f"gsl_{gs_name}"] = mask.astype(bool)
@@ -571,7 +580,7 @@ def main() -> None:
 
     print(DIVIDER)
     print("  Phase 1 · High-Fidelity Environment Modeling  (J2-Perturbed)")
-    print("  Walker Delta 60/5/1 | Alt 550 km | Inc 53° | ISL ≤ 2,000 km")
+    print(f"  Walker Delta 60/5/1 | Alt 550 km | Inc 53° | ISL ≤ {ISL_THRESHOLD_M/1000:,.0f} km")
     print(DIVIDER)
 
     # ── Data Management: clean slate ─────────────────────────────────────────

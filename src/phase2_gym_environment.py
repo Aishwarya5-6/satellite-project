@@ -33,13 +33,14 @@ import numpy as np
 import gymnasium as gym
 
 # ── Observation Layout ────────────────────────────────────────────────────────
-N_NEIGHBORS = 4          # Fixed number of observable neighbour slots
+N_NEIGHBORS = 8          # Raised from 4 → 8: prevents truncation blindspots
 N_FEATURES  = 3          # [norm_distance, norm_lrl, is_connected]
-OBS_DIM     = N_NEIGHBORS * N_FEATURES   # 12
+OBS_DIM     = N_NEIGHBORS * N_FEATURES   # 24
 
 # ── Physical & Constellation Constants ───────────────────────────────────────
 N_SATS       = 60
-MAX_ISL_KM   = 2_000.0        # ISL range threshold                [km]
+# MAX_ISL_KM is now loaded per-dataset from npz["isl_threshold_km"]
+# (set on self.max_isl_km in _load_topology).
 MAX_LRL_S          = 600.0     # Raw LRL ceiling (render only)      [s]
 LRL_HEALTH_HORIZON = 60.0      # Health-bar clip horizon            [s]
 C_LIGHT_KM_S       = 299_792.458  # Speed of light                  [km s⁻¹]
@@ -79,7 +80,7 @@ class SatelliteEnv(gym.Env):
     Observation — shape (12,) float32
     ──────────────────────────────────
     Slot k  (k = 0 … 3, sorted by **ascending satellite ID**):
-        obs[k*3 + 0]  norm_distance  ∈ [0, 1]    dist_km / MAX_ISL_KM
+        obs[k*3 + 0]  norm_distance  ∈ [0, 1]    dist_km / max_isl_km
         obs[k*3 + 1]  norm_lrl       ∈ [0, 1]    clip(lrl_s, 0, 60) / 60
         obs[k*3 + 2]  is_connected   ∈ {0.0, 1.0} 1 if this sat was chosen
                                                    in the previous step
@@ -182,8 +183,15 @@ class SatelliteEnv(gym.Env):
                 city = key[4:]                   # strip "gsl_" prefix
                 self.gsl_masks[city] = data[key] # (T, N) bool
 
+        # Dynamic ISL threshold (written by Phase 1; fallback for legacy npz)
+        if "isl_threshold_km" in data.files:
+            self.max_isl_km = float(data["isl_threshold_km"])
+        else:
+            self.max_isl_km = 5_000.0            # safe legacy default [km]
+
         print(f"done.  T={self.T} steps, N={N_SATS} sats, "
               f"{len(self.gsl_masks)} ground stations, "
+              f"ISL threshold={self.max_isl_km:.0f} km, "
               f"peak RAM≈{self.dist_km.nbytes*2/1e6:.0f} MB")
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -202,9 +210,10 @@ class SatelliteEnv(gym.Env):
 
         Any additional keyword arguments are merged in (e.g. reward, event).
         """
+        t_safe = min(t, self.T - 1)   # clamp for truncation edge (t == T)
         visible_gs = [
             city for city, mask in self.gsl_masks.items()
-            if mask[t, i]
+            if mask[t_safe, i]
         ]
         info: dict = {
             "timestep":    t,
@@ -324,7 +333,7 @@ class SatelliteEnv(gym.Env):
 
         if n_valid > 0:
             vj = nbr_idx                                          # (n_valid,)
-            obs[:n_valid, 0] = dist_row[vj] / MAX_ISL_KM         # norm distance ∈ [0,1]
+            obs[:n_valid, 0] = dist_row[vj] / self.max_isl_km    # norm distance ∈ [0,1]
             obs[:n_valid, 1] = np.clip(lrl_row[vj], 0.0, LRL_HEALTH_HORIZON) / LRL_HEALTH_HORIZON  # health-bar ∈ [0,1]
             obs[:n_valid, 2] = (vj == self._prev_nbr).astype(np.float32)  # is_connected
 
@@ -360,7 +369,7 @@ class SatelliteEnv(gym.Env):
         ──────────────
         R = -(W1 · NormLatency  +  W2 · ETA_S · I_switch)
 
-            NormLatency = dist_km / MAX_ISL_KM   ∈ [0, 1]
+            NormLatency = dist_km / max_isl_km   ∈ [0, 1]
             I_switch    = 1 if target_sat_id ≠ prev_sat_id (physical handover)
                           0 if same satellite or first connection (_prev_nbr == -1)
             ETA_S       = 3.0 s  (PAT acquisition delay)
@@ -417,6 +426,7 @@ class SatelliteEnv(gym.Env):
         # ones exist; for fully isolated satellites every slot is padded and
         # the penalty still applies, but the episode continues.
         if target_sat_id == -1:
+            self._prev_nbr = -1   # sever ghost link — no active ISL
             self._t   += 1
             truncated  = (self._t >= self.T)
             terminated = False
@@ -444,9 +454,9 @@ class SatelliteEnv(gym.Env):
 
         # Propagation latency, normalised against maximum ISL distance
         #   actual_latency [s] = dist_km / c
-        #   norm_latency       = actual_latency / (MAX_ISL_KM / c)
-        #                      = dist_km / MAX_ISL_KM   (c cancels)
-        norm_latency = dist_val / MAX_ISL_KM          # ∈ [0, 1]
+        #   norm_latency       = actual_latency / (max_isl_km / c)
+        #                      = dist_km / max_isl_km   (c cancels)
+        norm_latency = dist_val / self.max_isl_km     # ∈ [0, 1]
         latency_ms   = (dist_val / C_LIGHT_KM_S) * 1e3  # for logging
 
         # PAT switching indicator: based on physical satellite ID, NOT slot
@@ -480,6 +490,13 @@ class SatelliteEnv(gym.Env):
             if not self.connected[self._t, i].any():
                 terminated = True
 
+        # ── Target satellite ground-station visibility ─────────────────────
+        t_now = min(self._t, self.T - 1)
+        target_gs = [
+            city for city, mask in self.gsl_masks.items()
+            if mask[t_now, target_sat_id]
+        ]
+
         # ── Diagnostics ───────────────────────────────────────────────────────
         info = self._get_info(
             self._t, i,
@@ -492,6 +509,7 @@ class SatelliteEnv(gym.Env):
             I_switch=int(I_switch),
             raw_reward=round(raw_reward, 6),
             reward=reward,
+            target_visible_gs=target_gs,
         )
         return obs, reward, terminated, truncated, info
 
@@ -528,7 +546,7 @@ class SatelliteEnv(gym.Env):
                     "  │   {:d}   │ {:5s} │ {:7.1f} │ {:7.0f} │  {:3s}   │{}".format(
                         k,
                         f"s{j:02d}",
-                        d * MAX_ISL_KM,
+                        d * self.max_isl_km,
                         r * LRL_HEALTH_HORIZON,
                         "yes" if c > 0.5 else "no",
                         flag,

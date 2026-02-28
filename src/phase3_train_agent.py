@@ -54,7 +54,7 @@ TOPOLOGY_PATH = PROJECT_ROOT / "data" / "topology_dataset.npz"
 LOG_DIR       = PROJECT_ROOT / "logs"
 MODEL_DIR     = PROJECT_ROOT / "models"
 LOG_FILE      = LOG_DIR / "training_output.log"
-MD_LOG        = PROJECT_ROOT / "TRAINING_LOG.md"
+MD_LOG        = PROJECT_ROOT / "docs" / "TRAINING_LOG.md"
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -97,14 +97,14 @@ class TeeLogger:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def select_device() -> str:
-    """For MlpPolicy with small obs (12-dim), CPU is faster than MPS/CUDA.
+    """For MlpPolicy with small obs (24-dim), CPU is faster than MPS/CUDA.
     Data-transfer overhead to GPU exceeds compute benefit for tiny networks.
     See: https://github.com/DLR-RM/stable-baselines3/issues/1245
     """
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        print("  ✓ MPS detected — using CPU (faster for MlpPolicy, 12-dim obs)")
+        print("  ✓ MPS detected — using CPU (faster for MlpPolicy, 24-dim obs)")
     elif torch.cuda.is_available():
-        print("  ✓ CUDA detected — using CPU (faster for MlpPolicy, 12-dim obs)")
+        print("  ✓ CUDA detected — using CPU (faster for MlpPolicy, 24-dim obs)")
     else:
         print("  ✓ CPU selected")
     return "cpu"
@@ -285,6 +285,8 @@ class MarkdownTrackerCallback(BaseCallback):
             "wall":    elapsed,
             "elapsed": self._elapsed_str(),
         })
+        # Write MD snapshot so progress is visible during training
+        self._write(status="🔄 Training in progress")
         return True
 
     def _on_training_end(self) -> None:
@@ -366,7 +368,7 @@ class MarkdownTrackerCallback(BaseCallback):
 
         # ── best eval reward ──────────────────────────────────────────────────
         lines += [
-            "## 🏅 Best Eval Reward  *(EvalCallback, every 10 k steps)*",
+            "## 🏅 Best Eval Reward  *(EvalCallback, every 50k steps)*",
             "",
             f"**`{self._best_reward:.4f}`**"
             if self._best_reward != float("-inf")
@@ -438,11 +440,6 @@ def evaluate(model: PPO, n_episodes: int = 5) -> dict:
         invalids    = 0
         done        = False
 
-        # Count initial timestep GS visibility
-        if len(info.get("visible_gs", [])) > 0:
-            gs_visible += 1
-        total_steps += 1
-
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, info = eval_env.step(int(action))
@@ -462,7 +459,7 @@ def evaluate(model: PPO, n_episodes: int = 5) -> dict:
                 if lat > 0:
                     latencies.append(lat)
 
-            if len(info.get("visible_gs", [])) > 0:
+            if len(info.get("target_visible_gs", [])) > 0:
                 gs_visible += 1
 
         mean_lat   = float(np.mean(latencies)) if latencies else 0.0
@@ -647,19 +644,12 @@ def train() -> None:
     print(f"  💾 Model checkpoints → {MODEL_DIR / 'checkpoints'}  (every 100k steps)")
     print(f"  📋 Training log will be written to {MD_LOG} after training completes")
 
-    # ── 6. Interactive confirmation ───────────────────────────────────────────
+    # ── 6. Launch training ────────────────────────────────────────────────────
     print("─" * 72)
     print(f"  Ready to train for {TOTAL_TIMESTEPS:,} timesteps.")
     print(f"  Estimated time: ~60-90 min on Apple M4.")
     print("─" * 72)
-
-    # Restore real stdin for input prompt (TeeLogger only wraps stdout)
-    saved_stdout    = sys.stdout
-    sys.stdout      = tee._terminal   # type: ignore[assignment]
-    confirm = input("  Press ENTER to start training (or Ctrl-C to abort): ")
-    sys.stdout      = saved_stdout    # type: ignore[assignment]
-
-    print(f"  ✓ Confirmed — launching training loop\n")
+    print(f"  ✓ Launching training loop\n")
 
     # ── 7. Train ──────────────────────────────────────────────────────────────
     t0 = time.perf_counter()
