@@ -28,6 +28,8 @@ Usage
 
 from __future__ import annotations
 
+import atexit
+import subprocess
 import sys
 import time
 import resource
@@ -39,6 +41,7 @@ import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import (
     BaseCallback,
+    CheckpointCallback,
     EvalCallback,
     CallbackList,
 )
@@ -51,6 +54,7 @@ TOPOLOGY_PATH = PROJECT_ROOT / "data" / "topology_dataset.npz"
 LOG_DIR       = PROJECT_ROOT / "logs"
 MODEL_DIR     = PROJECT_ROOT / "models"
 LOG_FILE      = LOG_DIR / "training_output.log"
+MD_LOG        = PROJECT_ROOT / "TRAINING_LOG.md"
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -81,6 +85,9 @@ class TeeLogger:
         self._terminal.flush()
         self._log.flush()
 
+    def isatty(self) -> bool:
+        return False   # needed by SB3 / rich when stdout is redirected
+
     def close(self) -> None:
         self._log.close()
 
@@ -90,14 +97,16 @@ class TeeLogger:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def select_device() -> str:
-    """Select best accelerator: MPS → CUDA → CPU."""
+    """For MlpPolicy with small obs (12-dim), CPU is faster than MPS/CUDA.
+    Data-transfer overhead to GPU exceeds compute benefit for tiny networks.
+    See: https://github.com/DLR-RM/stable-baselines3/issues/1245
+    """
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        print("  ✓ MPS (Metal Performance Shaders) detected — Apple M4 GPU")
-        return "mps"
-    if torch.cuda.is_available():
-        print("  ✓ CUDA GPU detected")
-        return "cuda"
-    print("  ⚠ No GPU detected — falling back to CPU")
+        print("  ✓ MPS detected — using CPU (faster for MlpPolicy, 12-dim obs)")
+    elif torch.cuda.is_available():
+        print("  ✓ CUDA detected — using CPU (faster for MlpPolicy, 12-dim obs)")
+    else:
+        print("  ✓ CPU selected")
     return "cpu"
 
 
@@ -188,10 +197,6 @@ class HardwareMonitorCallback(BaseCallback):
             f"FPS {fps:7.0f}",
         ]
 
-        if self.hw_device == "mps":
-            mps_mb = torch.mps.current_allocated_memory() / 1e6
-            parts.append(f"MPS alloc {mps_mb:6.1f} MB")
-
         ru = resource.getrusage(resource.RUSAGE_SELF)
         rss_mb = ru.ru_maxrss / (1024 * 1024)
         parts.append(f"RSS {rss_mb:6.0f} MB")
@@ -199,15 +204,195 @@ class HardwareMonitorCallback(BaseCallback):
         print("  │  ".join(parts))
 
         # TensorBoard scalars
-        self.logger.record("hw/fps",       fps)
-        self.logger.record("hw/rss_mb",    rss_mb)
-        if self.hw_device == "mps":
-            self.logger.record("hw/mps_alloc_mb",
-                               torch.mps.current_allocated_memory() / 1e6)
+        self.logger.record("hw/fps",    fps)
+        self.logger.record("hw/rss_mb", rss_mb)
 
         self._prev_step = self.num_timesteps
         self._prev_time = wall
         return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# §4b  Markdown Live-Tracker Callback
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MarkdownTrackerCallback(BaseCallback):
+    """
+    Silently collects training metrics every ``update_freq`` steps.
+    Does NOT write anything during training — call finalize(eval_results)
+    after post-training evaluation to produce TRAINING_LOG.md in one shot.
+    """
+
+    def __init__(
+        self,
+        update_freq: int = 20_000,
+        device: str = "cpu",
+        total_timesteps: int = 1_000_000,
+        hyperparams: dict | None = None,
+        eval_cb: EvalCallback | None = None,
+    ) -> None:
+        super().__init__(verbose=0)
+        self.update_freq  = update_freq
+        self.hw_device    = device
+        self.total_steps  = total_timesteps
+        self.hyperparams  = hyperparams or {}
+        self.eval_cb      = eval_cb          # direct ref → reliable best_mean_reward
+        self._t0          = time.perf_counter()
+        self._rows: list[dict] = []
+        self._best_reward = float("-inf")
+        self._started     = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._eval_results: dict | None = None
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _elapsed_str(self) -> str:
+        s = int(time.perf_counter() - self._t0)
+        return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+    def _rss_mb(self) -> float:
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+
+    def _mps_mb(self) -> float:
+        if self.hw_device == "mps":
+            return torch.mps.current_allocated_memory() / 1e6
+        return 0.0
+
+    # ── SB3 hooks — data collection only, no file I/O ─────────────────────
+    def _on_training_start(self) -> None:
+        self._t0 = time.perf_counter()
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps % self.update_freq != 0:
+            return True
+
+        elapsed = time.perf_counter() - self._t0
+        prev    = self._rows[-1] if self._rows else {"step": 0, "wall": 0.0}
+        delta_s = elapsed - prev.get("wall", 0.0)
+        delta_n = self.num_timesteps - prev.get("step", 0)
+        fps     = delta_n / max(delta_s, 1e-9)
+
+        # Read best mean reward directly from EvalCallback instance
+        if self.eval_cb is not None:
+            candidate = getattr(self.eval_cb, "best_mean_reward", float("-inf"))
+            if candidate != float("-inf"):
+                self._best_reward = max(self._best_reward, float(candidate))
+
+        self._rows.append({
+            "step":    self.num_timesteps,
+            "pct":     100.0 * self.num_timesteps / self.total_steps,
+            "fps":     fps,
+            "mps_mb":  self._mps_mb(),
+            "rss_mb":  self._rss_mb(),
+            "wall":    elapsed,
+            "elapsed": self._elapsed_str(),
+        })
+        return True
+
+    def _on_training_end(self) -> None:
+        pass   # nothing written here — finalize() does it
+
+    def finalize(self, eval_results: dict) -> None:
+        """Call after evaluate() to append final results to the MD."""
+        self._eval_results = eval_results
+        self._write(status="✅ Training + Evaluation Complete")
+
+    # ── renderer ──────────────────────────────────────────────────────────────
+    def _write(self, status: str = "🔄 In Progress") -> None:
+        lines: list[str] = []
+
+        # ── header ────────────────────────────────────────────────────────────
+        lines += [
+            "# 🛰️ Phase 3 — PPO Training Log",
+            "",
+            "| | |",
+            "|---|---|",
+            f"| **Status** | {status} |",
+            f"| **Started** | {self._started} |",
+            f"| **Last updated** | {time.strftime('%Y-%m-%d %H:%M:%S')} |",
+            f"| **Elapsed** | {self._elapsed_str()} |",
+            f"| **Dataset** | `topology_dataset.npz` |",
+            f"| **Device** | `{self.hw_device}` |",
+            f"| **Total timesteps** | `{self.total_steps:,}` |",
+            "",
+        ]
+
+        # ── hyperparameters ───────────────────────────────────────────────────
+        lines += [
+            "## ⚙️ Hyperparameters",
+            "",
+            "| Parameter | Value |",
+            "|---|---|",
+        ]
+        for k, v in self.hyperparams.items():
+            lines.append(f"| `{k}` | `{v}` |")
+        lines.append("")
+
+        # ── system snapshot ───────────────────────────────────────────────────
+        lines += [
+            "## 🖥️ System Snapshot (latest)",
+            "",
+            "| Metric | Value |",
+            "|---|---|",
+            f"| RSS Memory | `{self._rss_mb():.0f} MB` |",
+        ]
+        if self.hw_device == "mps":
+            lines.append(f"| MPS Allocated | `{self._mps_mb():.1f} MB` |")
+            lines.append(f"| MPS Driver | `{torch.mps.driver_allocated_memory() / 1e6:.1f} MB` |")
+        lines.append("")
+
+        # ── progress table ────────────────────────────────────────────────────
+        lines += [
+            "## 📈 Training Progress",
+            "",
+        ]
+        if self._rows:
+            use_mps = self.hw_device == "mps"
+            hdr = "| Step | Progress | FPS |"
+            sep = "|---:|---:|---:|"
+            if use_mps:
+                hdr += " MPS Alloc (MB) |"
+                sep += "---:|"
+            hdr += " RSS (MB) | Elapsed |"
+            sep += "---:|---:|"
+            lines += [hdr, sep]
+            for r in self._rows:
+                row = f"| {r['step']:,} | {r['pct']:.1f}% | {r['fps']:,.0f} |"
+                if use_mps:
+                    row += f" {r['mps_mb']:.1f} |"
+                row += f" {r['rss_mb']:.0f} | `{r['elapsed']}` |"
+                lines.append(row)
+        else:
+            lines.append("_Waiting for first checkpoint…_")
+        lines.append("")
+
+        # ── best eval reward ──────────────────────────────────────────────────
+        lines += [
+            "## 🏅 Best Eval Reward  *(EvalCallback, every 10 k steps)*",
+            "",
+            f"**`{self._best_reward:.4f}`**"
+            if self._best_reward != float("-inf")
+            else "_Not yet evaluated_",
+            "",
+        ]
+
+        # ── final eval results ────────────────────────────────────────────────
+        if self._eval_results:
+            r = self._eval_results
+            lines += [
+                "## 📊 Final Evaluation — 5 × 86,400-step Episodes",
+                "",
+                "| Metric | Value |",
+                "|---|---|",
+                f"| Handover Jitter (switches/ep) | {r['handover_mean']:.1f} ± {r['handover_std']:.1f} |",
+                f"| Mean Propagation Delay (ms) | {r['latency_mean_ms']:.4f} ± {r['latency_std_ms']:.4f} |",
+                f"| GS Network Availability (%) | {r['gs_avail_mean']:.2f} ± {r['gs_avail_std']:.2f} |",
+                f"| Mean Episode Return | {r['return_mean']:.2f} ± {r['return_std']:.2f} |",
+                f"| Reward Stability σ | {r['return_std']:.2f} |",
+                f"| LRL Death Events / ep | {r['deaths_mean']:.1f} |",
+                f"| Invalid Actions / ep | {r['invalids_mean']:.1f} |",
+                "",
+            ]
+
+        MD_LOG.write_text("\n".join(lines), encoding="utf-8")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -362,6 +547,11 @@ ENT_COEF        = 0.01          # encourage exploration over 24 h orbit
 def train() -> None:
     """Run full PPO training pipeline with research-grade logging."""
 
+    # ── Caffeinate — prevent system/display sleep for the full run ────────────
+    _caff = subprocess.Popen(["caffeinate", "-di"])
+    atexit.register(lambda: _caff.poll() is None and _caff.terminate())  # safe: only if still running
+    print(f"  ☕ caffeinate started (PID {_caff.pid}) — display + idle sleep blocked")
+
     # ── 0. Tee all output to log file ────────────────────────────────────────
     tee = TeeLogger(LOG_FILE)
     sys.stdout = tee   # type: ignore[assignment]
@@ -423,13 +613,39 @@ def train() -> None:
         eval_env,
         best_model_save_path=str(MODEL_DIR),
         log_path=str(LOG_DIR),
-        eval_freq=10_000,
-        n_eval_episodes=5,
+        eval_freq=50_000,        # 20 evals total (was 100) — eval dominates runtime
+        n_eval_episodes=3,       # 3 eps × 86,400 steps each (was 5)
         deterministic=True,
         verbose=1,
     )
     hw_callback = HardwareMonitorCallback(log_freq=20_000, device=device)
-    callbacks   = CallbackList([eval_callback, hw_callback])
+    ckpt_callback = CheckpointCallback(
+        save_freq=100_000,
+        save_path=str(MODEL_DIR / "checkpoints"),
+        name_prefix="ppo_satellite",
+        save_replay_buffer=False,
+        verbose=1,
+    )
+    md_callback = MarkdownTrackerCallback(
+        update_freq=20_000,
+        device=device,
+        total_timesteps=TOTAL_TIMESTEPS,
+        eval_cb=eval_callback,
+        hyperparams={
+            "learning_rate":   LR,
+            "n_steps":         N_STEPS,
+            "batch_size":      BATCH_SIZE,
+            "gamma":           GAMMA,
+            "ent_coef":        ENT_COEF,
+            "total_timesteps": f"{TOTAL_TIMESTEPS:,}",
+            "policy":          "MlpPolicy",
+            "current_sat":     "-1 (universal)",
+            "seed":            42,
+        },
+    )
+    callbacks   = CallbackList([eval_callback, hw_callback, ckpt_callback, md_callback])
+    print(f"  💾 Model checkpoints → {MODEL_DIR / 'checkpoints'}  (every 100k steps)")
+    print(f"  📋 Training log will be written to {MD_LOG} after training completes")
 
     # ── 6. Interactive confirmation ───────────────────────────────────────────
     print("─" * 72)
@@ -465,12 +681,15 @@ def train() -> None:
 
     # ── 9. Post-training evaluation (5 × 86,400-step episodes) ────────────────
     results = evaluate(model, n_episodes=5)
+    md_callback.finalize(results)
+    print(f"  📝 Training log finalized → {MD_LOG}")
 
     # ── 10. Final hardware report ─────────────────────────────────────────────
     print("  Final Hardware State")
-    if device == "mps":
+    if torch.backends.mps.is_available():
         alloc  = torch.mps.current_allocated_memory() / 1e6
         driver = torch.mps.driver_allocated_memory() / 1e6
+        print(f"    MPS available  : yes (unused — CPU used for MlpPolicy)")
         print(f"    MPS allocated  : {alloc:.2f} MB")
         print(f"    MPS driver     : {driver:.2f} MB")
     ru = resource.getrusage(resource.RUSAGE_SELF)
@@ -484,6 +703,9 @@ def train() -> None:
     # ── Cleanup ───────────────────────────────────────────────────────────────
     train_env.close()
     eval_env.close()
+
+    _caff.terminate()
+    print("  ☕ caffeinate terminated — system sleep re-enabled")
 
     sys.stdout = tee._terminal   # type: ignore[assignment]
     sys.stderr = tee._terminal   # type: ignore[assignment]
