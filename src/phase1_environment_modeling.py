@@ -12,7 +12,7 @@ Constellation Parameters:
   - Walker Delta T/P/F  : 60 / 5 / 1
   - Altitude            : 550 km
   - Inclination         : 53°
-  - ISL threshold       : 2,000 km  (line-of-sight guaranteed ≤ 5,407 km)
+  - ISL threshold       : ~3,941 km  (dynamic: intra-plane chord × 1.10)
 
 Physics Engine:
   - Earth-Centered Inertial (ECI) Cartesian frame (x, y, z)
@@ -30,7 +30,7 @@ Output:
             gsl_<city>    (T,N)   bool     per ground station
 
 Ground Station Link (GSL) Support:
-  - 5 reference ground stations (London, New York, Tokyo, Sydney, São Paulo)
+  - 24 IEEE-standard global ground stations (New York → Azores, global coverage)
   - Geodetic → ECEF → ECI with Earth rotation
   - Elevation-mask visibility: min elevation 25°
 
@@ -65,13 +65,33 @@ F_PHASING        = 1                   # Walker phasing parameter
 # ISL_THRESHOLD_M is computed dynamically after SMA is defined (see below).
 
 # ── Ground Stations (GSL) ────────────────────────────────────────────────────
+#   IEEE-standard 24-station global configuration
 #   { name: (latitude_deg, longitude_deg) }  — East-positive longitudes
 GROUND_STATIONS: dict[str, tuple[float, float]] = {
-    "London":    ( 51.5074,   -0.1278),
-    "New_York":  ( 40.7128,  -74.0060),
-    "Tokyo":     ( 35.6762,  139.6503),
-    "Sydney":    (-33.8688,  151.2093),
-    "Sao_Paulo": (-23.5505,  -46.6333),
+    "New_York":      ( 40.7128,  -74.0060),
+    "Los_Angeles":   ( 34.0522, -118.2437),
+    "Seattle":       ( 47.6062, -122.3321),
+    "Miami":         ( 25.7617,  -80.1918),
+    "Sao_Paulo":     (-23.5505,  -46.6333),
+    "Buenos_Aires":  (-34.6037,  -58.3816),
+    "Santiago":      (-33.4489,  -70.6693),
+    "London":        ( 51.5074,   -0.1278),
+    "Frankfurt":     ( 50.1109,    8.6821),
+    "Madrid":        ( 40.4168,   -3.7038),
+    "Cairo":         ( 30.0444,   31.2357),
+    "Lagos":         (  6.5244,    3.3792),
+    "Johannesburg":  (-26.2041,   28.0473),
+    "Dubai":         ( 25.2048,   55.2708),
+    "Tokyo":         ( 35.6762,  139.6503),
+    "Seoul":         ( 37.5665,  126.9780),
+    "Singapore":     (  1.3521,  103.8198),
+    "Mumbai":        ( 19.0760,   72.8777),
+    "Hong_Kong":     ( 22.3193,  114.1694),
+    "Sydney":        (-33.8688,  151.2093),
+    "Perth":         (-31.9505,  115.8605),
+    "Hawaii":        ( 21.3069, -157.8583),
+    "Guam":          ( 13.4443,  144.7937),
+    "Azores":        ( 37.7412,  -25.6629),
 }
 MIN_ELEVATION_DEG = 25.0               # Minimum elevation for GSL access [°]
 

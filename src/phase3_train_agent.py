@@ -6,14 +6,14 @@ Phase 3 — PPO Agent Training  (IEEE Submission-Grade)
 Research  :  Stability-Aware LEO Routing via Deep Reinforcement Learning
 Algorithm :  Proximal Policy Optimisation (PPO)  via Stable-Baselines3 2.7.1
 Hardware  :  Apple M4 (Metal Performance Shaders — MPS backend)
-Dataset   :  topology_dataset.npz  (86,400 s, J2-perturbed, 5 GS, float16 km)
+Dataset   :  topology_dataset.npz  (86,400 s, J2-perturbed, 24 GS, float16 km)
 
 Pipeline
 ────────
   1. Validate the .npz dataset exists and detect hardware (MPS / CUDA / CPU)
   2. Instantiate SatelliteEnv with current_sat=-1 (universal decentralised policy)
   3. Build PPO(MlpPolicy) with publication hyperparameters
-  4. Confirm training launch interactively, then train for 1,000,000 timesteps
+  4. Train for 1,000,000 timesteps with EvalCallback (every 50k steps)
   5. Run 5 full-orbit evaluation episodes (86,400 steps each)
   6. Log research metrics: handover jitter, propagation delay,
      GS network availability, reward stability
@@ -29,6 +29,7 @@ Usage
 from __future__ import annotations
 
 import atexit
+import json
 import subprocess
 import sys
 import time
@@ -230,13 +231,15 @@ class MarkdownTrackerCallback(BaseCallback):
         total_timesteps: int = 1_000_000,
         hyperparams: dict | None = None,
         eval_cb: EvalCallback | None = None,
+        n_eval_episodes: int = 5,
     ) -> None:
         super().__init__(verbose=0)
-        self.update_freq  = update_freq
-        self.hw_device    = device
-        self.total_steps  = total_timesteps
-        self.hyperparams  = hyperparams or {}
-        self.eval_cb      = eval_cb          # direct ref → reliable best_mean_reward
+        self.update_freq     = update_freq
+        self.hw_device       = device
+        self.total_steps     = total_timesteps
+        self.hyperparams     = hyperparams or {}
+        self.eval_cb         = eval_cb          # direct ref → reliable best_mean_reward
+        self.n_eval_episodes = n_eval_episodes
         self._t0          = time.perf_counter()
         self._rows: list[dict] = []
         self._best_reward = float("-inf")
@@ -380,7 +383,7 @@ class MarkdownTrackerCallback(BaseCallback):
         if self._eval_results:
             r = self._eval_results
             lines += [
-                "## 📊 Final Evaluation — 5 × 86,400-step Episodes",
+                f"## 📊 Final Evaluation — {self.n_eval_episodes} × 86,400-step Episodes",
                 "",
                 "| Metric | Value |",
                 "|---|---|",
@@ -415,7 +418,7 @@ def evaluate(model: PPO, n_episodes: int = 5) -> dict:
     6. Invalid Actions       :  count of padded-slot selections
     """
     print("─" * 72)
-    print("  Post-Training Evaluation  —  5 full-orbit episodes (86,400 s each)")
+    print(f"  Post-Training Evaluation  —  {n_episodes} full-orbit episodes (86,400 s each)")
     print("─" * 72)
 
     eval_env = make_env(sat_id=-1)   # random satellite per episode
@@ -426,6 +429,7 @@ def evaluate(model: PPO, n_episodes: int = 5) -> dict:
     ep_gs_avail:   list[float] = []
     ep_deaths:     list[int]   = []
     ep_invalids:   list[int]   = []
+    all_trajectories: list[list[dict]] = []  # one list-of-dicts per episode
 
     for ep in range(n_episodes):
         obs, info = eval_env.reset(seed=ep + 1000)
@@ -439,6 +443,7 @@ def evaluate(model: PPO, n_episodes: int = 5) -> dict:
         deaths      = 0
         invalids    = 0
         done        = False
+        ep_trajectory: list[dict] = []  # step-by-step routing history
 
         while not done:
             action, _ = model.predict(obs, deterministic=True)
@@ -462,6 +467,15 @@ def evaluate(model: PPO, n_episodes: int = 5) -> dict:
             if len(info.get("target_visible_gs", [])) > 0:
                 gs_visible += 1
 
+            # ── Trajectory record for map-plotting ────────────────────────────
+            ep_trajectory.append({
+                "step":         total_steps,
+                "current_sat":  int(info.get("current_sat", -1)),
+                "action":       int(action),
+                "reward":       float(reward),
+                "gs_visibility": list(info.get("target_visible_gs", [])),
+            })
+
         mean_lat   = float(np.mean(latencies)) if latencies else 0.0
         gs_pct     = 100.0 * gs_visible / max(total_steps, 1)
 
@@ -471,6 +485,7 @@ def evaluate(model: PPO, n_episodes: int = 5) -> dict:
         ep_gs_avail.append(gs_pct)
         ep_deaths.append(deaths)
         ep_invalids.append(invalids)
+        all_trajectories.append(ep_trajectory)
 
         print(f"    Ep {ep+1}/{n_episodes}  sat_{sat_id:02d}  │  "
               f"HO: {handovers:5d}  │  "
@@ -523,6 +538,15 @@ def evaluate(model: PPO, n_episodes: int = 5) -> dict:
     print(f"  {'Steps / episode':<40s} {'86,400':>28s}")
     print(f"  {'Policy':<40s} {'universal (current_sat=-1)':>28s}")
     print("=" * W)
+    print()
+
+    # ── Save trajectory log for post-training map visualisation ──────────────
+    traj_path = PROJECT_ROOT / "docs" / "eval_trajectories.json"
+    with open(traj_path, "w", encoding="utf-8") as f:
+        json.dump(all_trajectories, f, indent=2)
+    print(f"  🗺️  Trajectory log saved → {traj_path}")
+    print(f"       ({n_episodes} episodes × 86,400 steps, "
+          f"{sum(len(e) for e in all_trajectories):,} total records)")
     print()
 
     return results
@@ -628,16 +652,22 @@ def train() -> None:
         device=device,
         total_timesteps=TOTAL_TIMESTEPS,
         eval_cb=eval_callback,
+        n_eval_episodes=5,
         hyperparams={
-            "learning_rate":   LR,
-            "n_steps":         N_STEPS,
-            "batch_size":      BATCH_SIZE,
-            "gamma":           GAMMA,
-            "ent_coef":        ENT_COEF,
-            "total_timesteps": f"{TOTAL_TIMESTEPS:,}",
-            "policy":          "MlpPolicy",
-            "current_sat":     "-1 (universal)",
-            "seed":            42,
+            "learning_rate":    LR,
+            "n_steps":          N_STEPS,
+            "batch_size":       BATCH_SIZE,
+            "gamma":            GAMMA,
+            "ent_coef":         ENT_COEF,
+            "total_timesteps":  f"{TOTAL_TIMESTEPS:,}",
+            "policy":           "MlpPolicy",
+            "obs_dim":          24,
+            "action_space":     "Discrete(8)",
+            "reward_range":     "[-50.0, 5.0]",
+            "gs_bonus":         5.0,
+            "n_ground_stations": 24,
+            "current_sat":      "-1 (universal)",
+            "seed":             42,
         },
     )
     callbacks   = CallbackList([eval_callback, hw_callback, ckpt_callback, md_callback])
@@ -652,45 +682,58 @@ def train() -> None:
     print(f"  ✓ Launching training loop\n")
 
     # ── 7. Train ──────────────────────────────────────────────────────────────
-    t0 = time.perf_counter()
-
-    model.learn(
-        total_timesteps=TOTAL_TIMESTEPS,
-        callback=callbacks,
-        tb_log_name="ppo_satellite",
-    )
-
-    elapsed = time.perf_counter() - t0
-    avg_fps = TOTAL_TIMESTEPS / max(elapsed, 1e-9)
-    print(f"\n  Training complete — {elapsed:.1f} s  ({avg_fps:,.0f} steps/s)")
+    t0        = time.perf_counter()
+    completed = False
+    avg_fps   = 0.0
+    elapsed   = 0.0
+    try:
+        model.learn(
+            total_timesteps=TOTAL_TIMESTEPS,
+            callback=callbacks,
+            tb_log_name="ppo_satellite",
+        )
+        completed = True
+    except KeyboardInterrupt:
+        print("\n  ⚠  KeyboardInterrupt — saving partial checkpoint …")
+        partial_path = MODEL_DIR / "partial_model"
+        model.save(str(partial_path))
+        print(f"  ✓ Partial model saved → {partial_path}.zip")
+    finally:
+        elapsed  = time.perf_counter() - t0
+        avg_fps  = max(model.num_timesteps, 1) / max(elapsed, 1e-9)
+        status   = "complete" if completed else "interrupted"
+        print(f"\n  Training {status} — {elapsed:.1f} s  ({avg_fps:,.0f} steps/s)")
+        print(f"  Timesteps completed: {model.num_timesteps:,} / {TOTAL_TIMESTEPS:,}")
+        sys.stdout.flush()
 
     # ── 8. Save final model ───────────────────────────────────────────────────
-    final_path = MODEL_DIR / "stability_ppo_m4"
-    model.save(str(final_path))
-    print(f"  ✓ Final model saved → {final_path}.zip\n")
+    if completed:
+        final_path = MODEL_DIR / "stability_ppo_m4"
+        model.save(str(final_path))
+        print(f"  ✓ Final model saved → {final_path}.zip\n")
 
-    # ── 9. Post-training evaluation (5 × 86,400-step episodes) ────────────────
-    results = evaluate(model, n_episodes=5)
-    md_callback.finalize(results)
-    print(f"  📝 Training log finalized → {MD_LOG}")
+        # ── 9. Post-training evaluation (5 × 86,400-step episodes) ────────────
+        results = evaluate(model, n_episodes=5)
+        md_callback.finalize(results)
+        print(f"  📝 Training log finalized → {MD_LOG}")
 
-    # ── 10. Final hardware report ─────────────────────────────────────────────
-    print("  Final Hardware State")
-    if torch.backends.mps.is_available():
-        alloc  = torch.mps.current_allocated_memory() / 1e6
-        driver = torch.mps.driver_allocated_memory() / 1e6
-        print(f"    MPS available  : yes (unused — CPU used for MlpPolicy)")
-        print(f"    MPS allocated  : {alloc:.2f} MB")
-        print(f"    MPS driver     : {driver:.2f} MB")
-    ru = resource.getrusage(resource.RUSAGE_SELF)
-    rss_mb = ru.ru_maxrss / (1024 * 1024)
-    print(f"    Peak system RSS: {rss_mb:.1f} MB")
-    print(f"    Training FPS   : {avg_fps:,.0f} steps/s")
-    print(f"    Wall-clock     : {elapsed:.1f} s  ({elapsed/60:.1f} min)")
-    print(f"    Finished       : {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print()
+        # ── 10. Final hardware report ─────────────────────────────────────────
+        print("  Final Hardware State")
+        if torch.backends.mps.is_available():
+            alloc  = torch.mps.current_allocated_memory() / 1e6
+            driver = torch.mps.driver_allocated_memory() / 1e6
+            print(f"    MPS available  : yes (unused — CPU used for MlpPolicy)")
+            print(f"    MPS allocated  : {alloc:.2f} MB")
+            print(f"    MPS driver     : {driver:.2f} MB")
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        rss_mb = ru.ru_maxrss / (1024 * 1024)
+        print(f"    Peak system RSS: {rss_mb:.1f} MB")
+        print(f"    Training FPS   : {avg_fps:,.0f} steps/s")
+        print(f"    Wall-clock     : {elapsed:.1f} s  ({elapsed/60:.1f} min)")
+        print(f"    Finished       : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print()
 
-    # ── Cleanup ───────────────────────────────────────────────────────────────
+    # ── Cleanup (always runs — even on interrupt) ─────────────────────────────
     train_env.close()
     eval_env.close()
 

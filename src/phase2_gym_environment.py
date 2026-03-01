@@ -9,17 +9,17 @@ Class:      SatelliteEnv(gym.Env)
 MDP Formulation
 ───────────────
 The agent controls ISL routing at a fixed satellite node across one complete
-orbital period (~5,730 timesteps at 1-second resolution).
+24-hour simulation (86,400 timesteps at 1-second resolution).
 
-At each step the agent observes the 4 nearest neighbours of its current
+At each step the agent observes the 8 nearest neighbours of its current
 satellite and selects which slot to route through. The reward penalises
 propagation latency and costly PAT (Pointing, Acquisition & Tracking)
 handovers when the agent switches links.
 
-Observation Space  :  Box(-1, 1, shape=(12,), dtype=float32)
-                       4 neighbour slots × 3 features
-Action Space       :  Discrete(4)  — slot index to select
-Reward             :  R = -(w1·NormLatency + w2·η_s·I_switch)  ∈ [-10, 0]
+Observation Space  :  Box(-1, 1, shape=(24,), dtype=float32)
+                       8 neighbour slots × 3 features
+Action Space       :  Discrete(8)  — slot index to select
+Reward             :  R = -(w1·NormLatency + w2·η_s·I_switch) + GS_BONUS  ∈ [-50, 5]
 
 ================================================================================
 """
@@ -49,10 +49,11 @@ C_LIGHT_KM_S       = 299_792.458  # Speed of light                  [km s⁻¹]
 W1         = 0.5    # Latency weight
 W2         = 1.0    # Switching weight
 ETA_S      = 3.0    # PAT setup delay                              [s]
-R_INVALID  = -10.0  # Penalty for selecting a padded slot
-R_LRL_DEATH = -50.0 # Penalty for link breakage (LRL → 0 while connected)
-REWARD_MIN = -50.0  # Clipping floor  (widened for LRL death penalty)
-REWARD_MAX =   0.0  # Clipping ceiling
+R_INVALID   = -10.0  # Penalty for selecting a padded slot
+R_LRL_DEATH = -50.0  # Penalty for link breakage (LRL → 0 while connected)
+GS_BONUS    =   5.0  # Bonus for routing to a ground-station-visible satellite
+REWARD_MIN  = -50.0  # Clipping floor  (widened for LRL death penalty)
+REWARD_MAX  =   5.0  # Clipping ceiling (raised to allow GS bonus)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -77,22 +78,25 @@ class SatelliteEnv(gym.Env):
     render_mode   : str | None
         ``"ansi"`` for a text-based console render; ``None`` to disable.
 
-    Observation — shape (12,) float32
+    Observation — shape (24,) float32
     ──────────────────────────────────
-    Slot k  (k = 0 … 3, sorted by **ascending satellite ID**):
+    Slot k  (k = 0 … 7, sorted by **ascending satellite ID**):
         obs[k*3 + 0]  norm_distance  ∈ [0, 1]    dist_km / max_isl_km
         obs[k*3 + 1]  norm_lrl       ∈ [0, 1]    clip(lrl_s, 0, 60) / 60
         obs[k*3 + 2]  is_connected   ∈ {0.0, 1.0} 1 if this sat was chosen
                                                    in the previous step
     Padded (empty) slots: all three features set to -1.0.
 
-    Action — Discrete(4)
+    Action — Discrete(8)
     ─────────────────────
-    Select slot index {0, 1, 2, 3}.
+    Select slot index {0, 1, 2, 3, 4, 5, 6, 7}.
 
     Reward
     ──────
-    R = -(w1 · NormLatency  +  w2 · η_s · I_switch),  clipped to [-50, 0]
+    R = -(w1 · NormLatency  +  w2 · η_s · I_switch)  +  GS_BONUS,  clipped to [-50, 5]
+
+    GS Bonus:  +5.0 if the chosen satellite has ≥1 ground station visible
+               at the current timestep (incentivises GS-reachable routing).
 
     LRL Death Penalty:  if the agent's active link has LRL = 0 at the
     current timestep (link just broke), reward = -50.0.
@@ -287,7 +291,7 @@ class SatelliteEnv(gym.Env):
 
     def _get_obs(self) -> np.ndarray:
         """
-        Build the (12,) observation vector for the controlled satellite at t.
+        Build the (24,) observation vector for the controlled satellite at t.
 
         Phase 3.5:  neighbours are sorted by **ascending satellite ID**,
         NOT by distance.  This prevents the agent from exploiting slot
@@ -303,8 +307,8 @@ class SatelliteEnv(gym.Env):
 
         Returns
         -------
-        obs : np.ndarray  shape (12,)  float32
-              Flattened (4, 3) matrix; padded slots filled with -1.0.
+        obs : np.ndarray  shape (24,)  float32
+              Flattened (8, 3) matrix; padded slots filled with -1.0.
         """
         t = self._t
         i = self._current_sat
@@ -314,14 +318,14 @@ class SatelliteEnv(gym.Env):
         lrl_row  = self.lrl_s[t, i]            # (N,) float32
         nbr_idx  = np.where(self.connected[t, i])[0]   # indices of live links
 
-        # ── Step 3: sort by ascending satellite ID, keep top-4 ───────────────
+        # ── Step 3: sort by ascending satellite ID, keep top-8 ───────────────
         #   Phase 3.5: np.where already returns sorted indices, but we call
         #   np.sort explicitly for clarity.  Slot 0 = lowest sat ID.
         if nbr_idx.size > 0:
             nbr_idx = np.sort(nbr_idx)                        # ID-sorted
-            nbr_idx = nbr_idx[:N_NEIGHBORS]                   # top-4
+            nbr_idx = nbr_idx[:N_NEIGHBORS]                   # top-8
 
-        n_valid = nbr_idx.size   # ∈ {0, 1, 2, 3, 4}
+        n_valid = nbr_idx.size   # ∈ {0, 1, …, 8}
 
         # ── Step 4 & 5: batch-normalise + is_connected flag ──────────────────
         # Slot→satellite map: -1 marks empty padding slots
@@ -355,24 +359,26 @@ class SatelliteEnv(gym.Env):
 
         Parameters
         ----------
-        action : int   slot index ∈ {0, 1, 2, 3}
+        action : int   slot index ∈ {0, 1, 2, 3, 4, 5, 6, 7}
 
         Returns
         -------
-        obs        : np.ndarray  (12,)  float32
-        reward     : float       ∈ [-50.0, 0.0]
+        obs        : np.ndarray  (24,)  float32
+        reward     : float       ∈ [-50.0, 5.0]
         terminated : bool        True if satellite is fully isolated
         truncated  : bool        True after T steps (end of orbital period)
         info       : dict        full diagnostic data for logging / analysis
 
         Reward formula
         ──────────────
-        R = -(W1 · NormLatency  +  W2 · ETA_S · I_switch)
+        R = -(W1 · NormLatency  +  W2 · ETA_S · I_switch)  +  GS_BONUS
 
             NormLatency = dist_km / max_isl_km   ∈ [0, 1]
             I_switch    = 1 if target_sat_id ≠ prev_sat_id (physical handover)
                           0 if same satellite or first connection (_prev_nbr == -1)
             ETA_S       = 3.0 s  (PAT acquisition delay)
+            GS_BONUS    = +5.0 if ≥1 ground station visible at target sat,
+                           0.0 otherwise
 
         Phase 3.5 — LRL Death Penalty
         ──────────────────────────────
@@ -397,7 +403,8 @@ class SatelliteEnv(gym.Env):
                 lrl_death = True
 
         if lrl_death:
-            self._prev_nbr = -1       # link is broken; no active connection
+            broken_sat     = self._prev_nbr   # save before overwriting
+            self._prev_nbr = -1               # link is broken; no active connection
             self._t       += 1
             truncated  = (self._t >= self.T)
             terminated = False
@@ -416,7 +423,7 @@ class SatelliteEnv(gym.Env):
                     self._t, i,
                     event="lrl_death_penalty",
                     reward=R_LRL_DEATH,
-                    broken_link=self._prev_nbr,
+                    broken_link=broken_sat,
                 ),
             )
 
@@ -471,8 +478,19 @@ class SatelliteEnv(gym.Env):
         else:
             I_switch = 0.0                             # same satellite
 
-        # Core reward (always ≤ 0); clip to prevent gradient explosion on M4
+        # ── Ground Station Bonus ──────────────────────────────────────────────
+        # Computed at decision time t so the bonus is consistent with the
+        # latency / switch penalty terms above.  +5.0 explicitly incentivises
+        # the agent to route through GS-reachable satellites.
+        target_gs = [
+            city for city, mask in self.gsl_masks.items()
+            if mask[t, target_sat_id]
+        ]
+
+        # Core reward — negative base; positive only when GS is visible
         raw_reward = -(W1 * norm_latency + W2 * ETA_S * I_switch)
+        if len(target_gs) > 0:
+            raw_reward += GS_BONUS
         reward     = float(np.clip(raw_reward, REWARD_MIN, REWARD_MAX))
 
         # ── State advance ─────────────────────────────────────────────────────
@@ -489,13 +507,6 @@ class SatelliteEnv(gym.Env):
             # Terminate if the satellite becomes completely isolated
             if not self.connected[self._t, i].any():
                 terminated = True
-
-        # ── Target satellite ground-station visibility ─────────────────────
-        t_now = min(self._t, self.T - 1)
-        target_gs = [
-            city for city, mask in self.gsl_masks.items()
-            if mask[t_now, target_sat_id]
-        ]
 
         # ── Diagnostics ───────────────────────────────────────────────────────
         info = self._get_info(
@@ -662,7 +673,7 @@ def _run_smoke_test(topo_path: Path) -> None:
         print(f"       Time still advanced: t {t_before} → {env._t}  ✓  "
               f"(physical time always passes)")
     else:
-        print("       All 4 slots filled at t=0 — pad test skipped.")
+        print("       All 8 slots filled at t=0 — pad test skipped.")
 
     # ── 6. Randomised satellite selection (Phase 3.5 change #3) ──────────────
     print(f"\n{'─'*68}")
