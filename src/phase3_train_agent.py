@@ -557,7 +557,7 @@ def evaluate(model: PPO, n_episodes: int = 5) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Training Hyperparameters ──────────────────────────────────────────────────
-TOTAL_TIMESTEPS = 1_000_000
+TOTAL_TIMESTEPS = 3_000_000
 LR              = 3e-4
 N_STEPS         = 2048
 BATCH_SIZE      = 64
@@ -663,8 +663,9 @@ def train() -> None:
             "policy":           "MlpPolicy",
             "obs_dim":          24,
             "action_space":     "Discrete(8)",
-            "reward_range":     "[-50.0, 5.0]",
-            "gs_bonus":         5.0,
+            "reward_range":     "[-500.0, 1.0]",
+            "gs_bonus":         0.5,
+            "lrl_transform":    "sqrt(clip(lrl,0,60)/60)",
             "n_ground_stations": 24,
             "current_sat":      "-1 (universal)",
             "seed":             42,
@@ -677,7 +678,7 @@ def train() -> None:
     # ── 6. Launch training ────────────────────────────────────────────────────
     print("─" * 72)
     print(f"  Ready to train for {TOTAL_TIMESTEPS:,} timesteps.")
-    print(f"  Estimated time: ~60-90 min on Apple M4.")
+    print(f"  Estimated time: ~40 min on Apple M4.")
     print("─" * 72)
     print(f"  ✓ Launching training loop\n")
 

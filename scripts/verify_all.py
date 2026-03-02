@@ -7,6 +7,8 @@ import ast
 import pathlib
 import sys
 
+import gymnasium as gym
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -45,9 +47,9 @@ print(f"  N_NEIGHBORS       = {N_NEIGHBORS}   (expected 8)")
 print(f"  OBS_DIM           = {OBS_DIM}   (expected 24)")
 print(f"  N_SATS            = {N_SATS}   (expected 60)")
 print(f"  R_INVALID         = {R_INVALID}  (expected -10.0)")
-print(f"  R_LRL_DEATH       = {R_LRL_DEATH}  (expected -50.0)")
-print(f"  GS_BONUS          = {GS_BONUS}   (expected 5.0)")
-print(f"  REWARD_MIN/MAX    = {REWARD_MIN} / {REWARD_MAX}  (expected -50.0 / 5.0)")
+print(f"  R_LRL_DEATH       = {R_LRL_DEATH}  (expected -500.0)")
+print(f"  GS_BONUS          = {GS_BONUS}   (expected 0.5)")
+print(f"  REWARD_MIN/MAX    = {REWARD_MIN} / {REWARD_MAX}  (expected -500.0 / 1.0)")
 print(f"  W1/W2/ETA_S       = {W1} / {W2} / {ETA_S}")
 print(f"  LRL_HEALTH_HORIZON= {LRL_HEALTH_HORIZON}  (expected 60.0)")
 
@@ -55,10 +57,10 @@ assert N_NEIGHBORS == 8,        f"N_NEIGHBORS={N_NEIGHBORS}, expected 8"
 assert OBS_DIM == 24,           f"OBS_DIM={OBS_DIM}, expected 24"
 assert N_SATS == 60,            f"N_SATS={N_SATS}, expected 60"
 assert R_INVALID == -10.0,      f"R_INVALID wrong"
-assert R_LRL_DEATH == -50.0,    f"R_LRL_DEATH wrong"
-assert GS_BONUS == 5.0,         f"GS_BONUS wrong"
-assert REWARD_MIN == -50.0,     f"REWARD_MIN wrong"
-assert REWARD_MAX == 5.0,       f"REWARD_MAX wrong"
+assert R_LRL_DEATH == -500.0,   f"R_LRL_DEATH wrong"
+assert GS_BONUS == 0.5,         f"GS_BONUS wrong"
+assert REWARD_MIN == -500.0,    f"REWARD_MIN wrong"
+assert REWARD_MAX == 1.0,       f"REWARD_MAX wrong"
 print("  ✓  All constants match expected values")
 
 # ── 3. Env spaces & info keys ─────────────────────────────────────────────────
@@ -74,6 +76,8 @@ print(f"  T          : {env.T} timesteps (expected 86400)")
 print(f"  max_isl_km : {env.max_isl_km:.0f} km (expected ~3941)")
 
 assert env.observation_space.shape == (24,), f"obs shape wrong: {env.observation_space.shape}"
+assert isinstance(env.action_space, gym.spaces.Discrete), \
+    f"action_space is not Discrete: {type(env.action_space)}"
 assert env.action_space.n == 8,              f"action space wrong: {env.action_space.n}"
 assert len(env.gsl_masks) == 24,             f"gsl_masks count wrong: {len(env.gsl_masks)}"
 assert env.T == 86400,                       f"T wrong: {env.T}"
@@ -111,6 +115,12 @@ assert "broken_link=broken_sat" in p2_src,          "broken_link=broken_sat miss
 assert "broken_link=self._prev_nbr" not in p2_src,  "old buggy broken_link= still present"
 print("  ✓  broken_link fix confirmed — saves ID before overwriting _prev_nbr")
 
+print()
+print("  Checking sqrt LRL transform…")
+assert "np.sqrt(linear_lrl)" in p2_src, "sqrt LRL transform missing from _get_obs()"
+assert "(r ** 2) * LRL_HEALTH_HORIZON" in p2_src, "sqrt back-transform missing from render()"
+print("  ✓  sqrt LRL transform present in _get_obs() and render()")
+
 env.close()
 
 # ── 4. Phase 3 source consistency ────────────────────────────────────────────
@@ -132,6 +142,7 @@ checks = {
     "action_space in hyperparams dict":             '"action_space"' in p3_src,
     "reward_range in hyperparams dict":             '"reward_range"' in p3_src,
     "gs_bonus in hyperparams dict":                 '"gs_bonus"' in p3_src,
+    "lrl_transform in hyperparams dict":            '"lrl_transform"' in p3_src,
     "n_ground_stations in hyperparams dict":        '"n_ground_stations"' in p3_src,
     "24 GS in header":                              "24 GS" in p3_src,
     "MlpPolicy used (correct for 24-dim obs)":      '"MlpPolicy"' in p3_src,
@@ -167,7 +178,7 @@ print("=" * 60)
 print("FINAL VERDICT")
 print("=" * 60)
 print("  ✓  Phase 1 — dataset correct (24 GS, ~3941 km ISL, 86400 steps)")
-print("  ✓  Phase 2 — env correct (obs=24, act=8, reward[-50,5], 24 GS loaded)")
+print("  ✓  Phase 2 — env correct (obs=24, act=8, reward[-500,1], 24 GS loaded)")
 print("  ✓  Phase 3 — fully aligned with Phase 1+2 changes")
 print("  ✓  All info keys that Phase 3 reads are present in Phase 2 step()")
 print("  ✓  READY FOR TRAINING")

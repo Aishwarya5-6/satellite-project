@@ -24,40 +24,40 @@ This created a **perceptual dead zone** in the observation space. The agent coul
 | 10 | **0.017** | Imminent death — but looks like ≈ 0 |
 | 0 | 0.000 | Dead |
 
-The difference between "10 seconds to live" and "already dead" was just **0.017** — well within the noise floor of a neural network. The agent had no usable gradient to learn proactive handovers before the −50.0 LRL death penalty fired.
+The difference between "10 seconds to live" and "already dead" was just **0.017** — well within the noise floor of a neural network. The agent had no usable gradient to learn proactive handovers before the −500.0 LRL death penalty fired.
 
 ---
 
 ## 2. Solution — 60-Second Health Bar
 
-Replace the full-range normalization with a **clipped health bar** that focuses exclusively on the critical last 60 seconds of link life:
+Replace the full-range normalization with a **clipped, sqrt-compressed health bar** that focuses exclusively on the critical last 60 seconds of link life:
 
 ```python
-obs[:n_valid, 1] = np.clip(lrl_row[vj], 0.0, LRL_HEALTH_HORIZON) / LRL_HEALTH_HORIZON
+obs[:n_valid, 1] = np.sqrt(np.clip(lrl_row[vj], 0.0, LRL_HEALTH_HORIZON) / LRL_HEALTH_HORIZON)
 ```
 
 Where `LRL_HEALTH_HORIZON = 60.0` seconds.
 
 ### New observation mapping
 
-| Raw LRL (s) | New `norm_lrl` (clip ÷ 60) | Interpretation |
+| Raw LRL (s) | New `norm_lrl` (√(clip ÷ 60)) | Interpretation |
 |---|---|---|
 | 300 | **1.000** | Safe (clamped) |
 | 60 | **1.000** | Safe (at horizon) |
-| 30 | **0.500** | Warning — halfway to death |
-| 10 | **0.167** | Danger — clearly visible |
+| 30 | **0.707** | Warning — halfway to death |
+| 10 | **0.408** | Danger — clearly visible |
 | 0 | 0.000 | Dead |
 
 ### Signal amplification
 
 | Raw LRL | Old value | New value | Amplification |
 |---|---|---|---|
-| 10 s | 0.017 | 0.167 | **10×** |
-| 30 s | 0.050 | 0.500 | **10×** |
-| 5 s | 0.008 | 0.083 | **10×** |
-| 1 s | 0.002 | 0.017 | **10×** |
+| 10 s | 0.017 | 0.408 | **24×** |
+| 30 s | 0.050 | 0.707 | **14×** |
+| 5 s | 0.008 | 0.289 | **36×** |
+| 1 s | 0.002 | 0.129 | **65×** |
 
-The danger signal is amplified by **10×** across the entire critical zone, giving the policy network a strong, linear gradient from "safe" (1.0) to "dead" (0.0) over the last minute of link life.
+The danger signal is amplified by **14–65×** across the entire critical zone, giving the policy network a strong, concave (√) gradient from "safe" (1.0) to "dead" (0.0) over the last minute of link life.
 
 ---
 
@@ -83,7 +83,7 @@ LRL_HEALTH_HORIZON = 60.0      # Health-bar clip horizon            [s]
 obs[:n_valid, 1] = lrl_row[vj]  / MAX_LRL_S          # norm LRL     ∈ [0,1]
 
 # After:
-obs[:n_valid, 1] = np.clip(lrl_row[vj], 0.0, LRL_HEALTH_HORIZON) / LRL_HEALTH_HORIZON  # health-bar ∈ [0,1]
+obs[:n_valid, 1] = np.sqrt(np.clip(lrl_row[vj], 0.0, LRL_HEALTH_HORIZON) / LRL_HEALTH_HORIZON)  # health-bar ∈ [0,1]
 ```
 
 ### 3c. Class docstring
@@ -93,7 +93,7 @@ obs[:n_valid, 1] = np.clip(lrl_row[vj], 0.0, LRL_HEALTH_HORIZON) / LRL_HEALTH_HO
 obs[k*3 + 1]  norm_lrl       ∈ [0, 1]    lrl_s   / MAX_LRL_S
 
 # After:
-obs[k*3 + 1]  norm_lrl       ∈ [0, 1]    clip(lrl_s, 0, 60) / 60
+obs[k*3 + 1]  norm_lrl       ∈ [0, 1]    sqrt(clip(lrl_s, 0, 60) / 60)
 ```
 
 ### 3d. `render()` — denormalization
@@ -103,7 +103,7 @@ obs[k*3 + 1]  norm_lrl       ∈ [0, 1]    clip(lrl_s, 0, 60) / 60
 r * MAX_LRL_S,       # displayed as raw LRL seconds
 
 # After:
-r * LRL_HEALTH_HORIZON,   # denormalize from health-bar scale
+(r ** 2) * LRL_HEALTH_HORIZON,   # denormalize from health-bar scale
 ```
 
 ---
@@ -118,7 +118,7 @@ The 60-second horizon was chosen to align with the reward structure:
 |---|---|---|
 | `ETA_S` (PAT delay) | 3.0 s | Agent needs time to detect danger and switch |
 | `LRL_HEALTH_HORIZON` | 60.0 s | ≈ 20× PAT delay — enough lead time for the agent to observe the declining health bar, evaluate alternatives, and execute a handover |
-| `R_LRL_DEATH` | −50.0 | Penalty for failing to act within the 60 s window |
+| `R_LRL_DEATH` | −500.0 | Penalty for failing to act within the 60 s window |
 
 At 60 seconds, any link with more than a minute of remaining life reads as `1.0` (safe). The agent does not waste representational capacity distinguishing between a 200 s link and a 400 s link — both are equally safe. All capacity is focused on the critical countdown from 60 → 0.
 
@@ -140,7 +140,7 @@ A logarithmic transform (e.g., `log(lrl + 1) / log(601)`) would preserve more ra
 | MDP Component | Before | After | Changed? |
 |---|---|---|---|
 | Observation space | Box(−1, 1, shape=(12,)) | Box(−1, 1, shape=(12,)) | No |
-| Observation semantics | `norm_lrl = lrl / 600` | `norm_lrl = clip(lrl, 0, 60) / 60` | **Yes** |
+| Observation semantics | `norm_lrl = lrl / 600` | `norm_lrl = sqrt(clip(lrl, 0, 60) / 60)` | **Yes** |
 | Action space | Discrete(4) | Discrete(4) | No |
 | Reward function | Unchanged | Unchanged | No |
 | Episode dynamics | Unchanged | Unchanged | No |
@@ -164,7 +164,7 @@ All 7/7 tests passed after the change:
 [4/7]  Reproducibility        → seed=99 identical both times          ✓
 [5/7]  Invalid action penalty → slot 1 padded, penalty=-10.0          ✓
 [6/7]  Randomised satellite   → 18 unique sats in 20 episodes         ✓
-[7/7]  Reward clipping        → all rewards in [-50.0, 0.0]           ✓
+[7/7]  Reward clipping        → all rewards in [-500.0, 1.0]          ✓
 
   Phase 3.5  SatelliteEnv Redesign — ALL TESTS PASSED ✓
 ```
@@ -177,7 +177,7 @@ Note: `lrl=1.0000` in test 1 confirms the health bar is working — the raw LRL 
 
 - **Phase 3 model is incompatible.** The old model was trained on `lrl / 600` semantics; it will misinterpret health-bar observations. Retraining from scratch is required.
 - **No architecture changes needed.** The observation shape and bounds are unchanged — the same PPO hyperparameters and network size can be reused.
-- **Render output changed.** The render table now displays LRL capped at 60 s instead of the raw value. Links with > 60 s remaining all display as `60`.
+- **Render output changed.** The render table back-transforms the sqrt-compressed health bar via `(r ** 2) * LRL_HEALTH_HORIZON`, displaying LRL capped at 60 s. Links with > 60 s remaining all display as `60`.
 
 ---
 

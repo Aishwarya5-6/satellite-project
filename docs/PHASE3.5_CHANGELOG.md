@@ -45,7 +45,7 @@ The Phase 3 PPO agent converged to a **trivial deterministic policy** (always se
 | # | Change | Location | Lines Changed |
 |---|---|---|---|
 | 1 | Sort neighbours by satellite ID (not distance) | `_get_obs()` method | 6 lines |
-| 2 | Add LRL Death Penalty (−50) | `step()` method + constants | 42 lines |
+| 2 | Add LRL Death Penalty (−500) | `step()` method + constants | 42 lines |
 | 3 | Randomise starting satellite | `__init__()` + `reset()` | 18 lines |
 | — | Docstring & comment updates | Class/method docstrings | 45 lines |
 | — | Smoke test expansion (5 → 7 tests) | `_run_smoke_test()` | 20 lines |
@@ -102,8 +102,8 @@ The `_get_obs()` docstring was updated:
 
 **New constant added:**
 ```python
-R_LRL_DEATH = -50.0  # Penalty for link breakage (LRL → 0 while connected)
-REWARD_MIN  = -50.0   # Clipping floor (widened from -10.0)
+R_LRL_DEATH = -500.0  # Penalty for link breakage (LRL → 0 while connected)
+REWARD_MIN  = -500.0   # Clipping floor (widened from -10.0)
 ```
 
 **New logic inserted at the top of `step()`, before the invalid-action guard:**
@@ -128,7 +128,7 @@ if lrl_death:
             terminated = True
     return (
         obs,
-        R_LRL_DEATH,           # -50.0
+        R_LRL_DEATH,           # -500.0
         terminated,
         truncated,
         {
@@ -145,7 +145,7 @@ if lrl_death:
 
 In the original environment, there was **no consequence** for staying connected to a link whose LRL was counting down to zero. The agent could "ride" a single link from episode start to termination without ever switching.
 
-The LRL Death Penalty creates a **proactive handover incentive**: the −3.0 switching cost (from `ETA_S = 3.0`) is vastly preferable to the −50.0 death penalty. The agent must now monitor `norm_lrl` and switch to a healthier link before the current one breaks.
+The LRL Death Penalty creates a **proactive handover incentive**: the −3.0 switching cost (from `ETA_S = 3.0`) is vastly preferable to the −500.0 death penalty. The agent must now monitor `norm_lrl` and switch to a healthier link before the current one breaks.
 
 ### Penalty hierarchy
 
@@ -154,7 +154,7 @@ The LRL Death Penalty creates a **proactive handover incentive**: the −3.0 swi
 | Normal routing (no switch) | −(0.5 · NormLatency) ≈ −0.2 | Latency cost |
 | Link handover | −3.0 (+ latency) ≈ −3.2 | PAT acquisition delay |
 | Invalid action (padded slot) | −10.0 | Avoid empty slots |
-| **Link breakage (LRL → 0)** | **−50.0** | **Force proactive switching** |
+| **Link breakage (LRL → 0)** | **−500.0** | **Force proactive switching** |
 
 ### Execution flow
 
@@ -163,7 +163,7 @@ The LRL death check runs **before** the invalid-action guard and **before** the 
 ```
 step(action)
   ├── 1. Check LRL death  (prev_nbr exists and LRL ≤ 0?)
-  │     └── YES → return R_LRL_DEATH = -50, reset prev_nbr
+  │     └── YES → return R_LRL_DEATH = -500, reset prev_nbr
   ├── 2. Check invalid action  (padded slot?)
   │     └── YES → return R_INVALID = -10
   └── 3. Normal reward computation
@@ -239,9 +239,9 @@ Random selection uses `self.np_random.integers()`, which is seeded by `reset(see
 
 | Constant | Phase 2 Value | Phase 3.5 Value | Reason |
 |---|---|---|---|
-| `R_LRL_DEATH` | *(did not exist)* | −50.0 | New death penalty constant |
-| `REWARD_MIN` | −10.0 | −50.0 | Widened clipping floor to accommodate death penalty |
-| `REWARD_MAX` | 0.0 | 0.0 | Unchanged |
+| `R_LRL_DEATH` | *(did not exist)* | −500.0 | New death penalty constant |
+| `REWARD_MIN` | −10.0 | −500.0 | Widened clipping floor to accommodate death penalty |
+| `REWARD_MAX` | 0.0 | 1.0 | Raised to accommodate GS_BONUS |
 | `R_INVALID` | −10.0 | −10.0 | Unchanged |
 | `W1` | 0.5 | 0.5 | Unchanged |
 | `W2` | 1.0 | 1.0 | Unchanged |
@@ -259,7 +259,7 @@ All docstrings were updated to reflect the Phase 3.5 changes:
 | Class docstring | Added "Phase 3.5 Redesign" section listing all 3 changes |
 | Class docstring | `current_sat` parameter: default documented as `-1` with randomisation explanation |
 | Class docstring | Slot ordering: "sorted nearest-first" → "sorted by ascending satellite ID" |
-| Class docstring | Reward range: `[-10, 0]` → `[-50, 0]` |
+| Class docstring | Reward range: `[-10, 0]` → `[-500, 1]` |
 | Class docstring | Added LRL Death Penalty description |
 | `reset()` docstring | Added Phase 3.5 note about random satellite selection |
 | `_get_obs()` docstring | Added Phase 3.5 note; updated Step 3 from `argsort` to `sort` |
@@ -279,7 +279,7 @@ The smoke test suite was expanded from **5 tests → 7 tests**:
 | 4/7 | Reproducibility | Reproducibility *(renumbered from 3/5)* | ✓ |
 | 5/7 | Invalid action penalty | Invalid action penalty *(renumbered from 4/5)* | ✓ |
 | **6/7** | *(did not exist)* | **Randomised satellite selection** | ✓ NEW |
-| 7/7 | Reward clipping | Reward clipping *(range updated to [−50, 0])* | ✓ |
+| 7/7 | Reward clipping | Reward clipping *(range updated to [−500, 1])* | ✓ |
 
 ### New test 2/7 — ID-sorted slot verification
 
@@ -306,7 +306,7 @@ Full output from `python src/phase2_gym_environment.py`:
 [4/7]  Reproducibility        → seed=99 identical both times          ✓
 [5/7]  Invalid action penalty → slot 1 padded, penalty=-10.0          ✓
 [6/7]  Randomised satellite   → 18 unique sats in 20 episodes         ✓
-[7/7]  Reward clipping        → all rewards in [-50.0, 0.0]           ✓
+[7/7]  Reward clipping        → all rewards in [-500.0, 1.0]          ✓
 
   Phase 3.5  SatelliteEnv Redesign — ALL TESTS PASSED ✓
 ```
@@ -320,7 +320,7 @@ The Phase 3 trained model (`models/stability_ppo_m4.zip`) is **no longer compati
 | Aspect | Phase 3 Model Expectation | Phase 3.5 Environment |
 |---|---|---|
 | Slot 0 | Nearest satellite (lowest distance) | Lowest-ID connected satellite |
-| Reward range | [−10, 0] | [−50, 0] |
+| Reward range | [−10, 0] | [−500, 1] |
 | Starting satellite | Always `sat_02` | Random from [0, 59] |
 | Optimal policy | Always Action 0 | Must inspect features & plan handovers |
 

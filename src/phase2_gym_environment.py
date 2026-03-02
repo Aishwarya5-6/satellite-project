@@ -19,7 +19,7 @@ handovers when the agent switches links.
 Observation Space  :  Box(-1, 1, shape=(24,), dtype=float32)
                        8 neighbour slots × 3 features
 Action Space       :  Discrete(8)  — slot index to select
-Reward             :  R = -(w1·NormLatency + w2·η_s·I_switch) + GS_BONUS  ∈ [-50, 5]
+Reward             :  R = -(w1·NormLatency + w2·η_s·I_switch) + GS_BONUS  ∈ [-500, 1]
 
 ================================================================================
 """
@@ -49,11 +49,11 @@ C_LIGHT_KM_S       = 299_792.458  # Speed of light                  [km s⁻¹]
 W1         = 0.5    # Latency weight
 W2         = 1.0    # Switching weight
 ETA_S      = 3.0    # PAT setup delay                              [s]
-R_INVALID   = -10.0  # Penalty for selecting a padded slot
-R_LRL_DEATH = -50.0  # Penalty for link breakage (LRL → 0 while connected)
-GS_BONUS    =   5.0  # Bonus for routing to a ground-station-visible satellite
-REWARD_MIN  = -50.0  # Clipping floor  (widened for LRL death penalty)
-REWARD_MAX  =   5.0  # Clipping ceiling (raised to allow GS bonus)
+R_INVALID   =  -10.0    # Penalty for padded slot — 3× a handover, clearly less than death
+R_LRL_DEATH = -500.0    # Catastrophic penalty for link breakage — 50× an invalid action
+GS_BONUS    =    0.5    # Learnable incentive: flips quiet step from −0.25 to +0.25
+REWARD_MIN  = -500.0    # Clipping floor  (matched to R_LRL_DEATH)
+REWARD_MAX  =    1.0    # Clipping ceiling (max realistic ≈ +0.45, never clips)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -64,7 +64,7 @@ class SatelliteEnv(gym.Env):
     Phase 3.5 Redesign
     ──────────────────
     • Slots are **sorted by satellite ID** (not distance).
-    • **LRL Death Penalty** (−50) on link breakage.
+    • **LRL Death Penalty** (−500) on link breakage.
     • **Randomised starting satellite** each episode.
 
     Parameters
@@ -82,7 +82,7 @@ class SatelliteEnv(gym.Env):
     ──────────────────────────────────
     Slot k  (k = 0 … 7, sorted by **ascending satellite ID**):
         obs[k*3 + 0]  norm_distance  ∈ [0, 1]    dist_km / max_isl_km
-        obs[k*3 + 1]  norm_lrl       ∈ [0, 1]    clip(lrl_s, 0, 60) / 60
+        obs[k*3 + 1]  norm_lrl       ∈ [0, 1]    √(clip(lrl_s, 0, 60) / 60)
         obs[k*3 + 2]  is_connected   ∈ {0.0, 1.0} 1 if this sat was chosen
                                                    in the previous step
     Padded (empty) slots: all three features set to -1.0.
@@ -93,13 +93,13 @@ class SatelliteEnv(gym.Env):
 
     Reward
     ──────
-    R = -(w1 · NormLatency  +  w2 · η_s · I_switch)  +  GS_BONUS,  clipped to [-50, 5]
+    R = -(w1 · NormLatency  +  w2 · η_s · I_switch)  +  GS_BONUS,  clipped to [-500, 1]
 
-    GS Bonus:  +5.0 if the chosen satellite has ≥1 ground station visible
-               at the current timestep (incentivises GS-reachable routing).
+    GS Bonus:  +0.5 if the chosen satellite has ≥1 ground station visible
+               at the current timestep (flips quiet steps positive — learnable signal).
 
     LRL Death Penalty:  if the agent's active link has LRL = 0 at the
-    current timestep (link just broke), reward = -50.0.
+    current timestep (link just broke), reward = -500.0.
 
     Invalid action (padded slot) → reward = -10.0.
     """
@@ -126,7 +126,7 @@ class SatelliteEnv(gym.Env):
         self._load_topology()
 
         # ── Gymnasium spaces ──────────────────────────────────────────────────
-        #   Observation: 4 slots × 3 features; padding uses -1.0 → low = -1.0
+        #   Observation: 8 slots × 3 features; padding uses -1.0 → low = -1.0
         self.observation_space = gym.spaces.Box(
             low=-1.0, high=1.0,
             shape=(OBS_DIM,),
@@ -254,7 +254,7 @@ class SatelliteEnv(gym.Env):
 
         Returns
         -------
-        obs  : np.ndarray, shape (12,), float32
+        obs  : np.ndarray, shape (24,), float32
         info : dict
         """
         # CRITICAL: call super().reset(seed=seed) first so self.np_random is
@@ -302,7 +302,7 @@ class SatelliteEnv(gym.Env):
           Step 1  Slice dist_km[t, i] → (N,) row fetch           O(N)
           Step 2  np.where(connected) → neighbour index array     O(N)
           Step 3  np.sort on satellite ID (already ascending)     O(k)
-          Step 4  Array index: dist[vj] / MAX, lrl[vj] / MAX      O(k)
+          Step 4  Array index: dist[vj] / MAX, √(lrl[vj] / MAX)   O(k)
           Step 5  Broadcast is_connected comparison vj==prev_nbr  O(k)
 
         Returns
@@ -338,12 +338,18 @@ class SatelliteEnv(gym.Env):
         if n_valid > 0:
             vj = nbr_idx                                          # (n_valid,)
             obs[:n_valid, 0] = dist_row[vj] / self.max_isl_km    # norm distance ∈ [0,1]
-            obs[:n_valid, 1] = np.clip(lrl_row[vj], 0.0, LRL_HEALTH_HORIZON) / LRL_HEALTH_HORIZON  # health-bar ∈ [0,1]
+            # √-transform: expands the signal near end-of-life so PPO
+            # perceives urgency sooner (linear 10% → √ 31.6%).
+            # Clip AFTER dividing so the argument to sqrt is always ≥ 1e-7,
+            # guarding against sqrt(negative) from floating-point drift.
+            # 1e-7 keeps the gradient 1/(2√x) ≤ ~1582 — well below instability.
+            linear_lrl = np.clip(lrl_row[vj] / LRL_HEALTH_HORIZON, 1e-7, 1.0)
+            obs[:n_valid, 1] = np.sqrt(linear_lrl).astype(np.float32)  # health-bar ∈ [0,1]
             obs[:n_valid, 2] = (vj == self._prev_nbr).astype(np.float32)  # is_connected
 
         # Cache for step() and render()
         self._slot_j   = slot_j
-        self._last_obs = obs.ravel()
+        self._last_obs = obs.ravel().astype(np.float32)  # explicit dtype guard
         return self._last_obs.copy()
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -364,7 +370,7 @@ class SatelliteEnv(gym.Env):
         Returns
         -------
         obs        : np.ndarray  (24,)  float32
-        reward     : float       ∈ [-50.0, 5.0]
+        reward     : float       ∈ [-500.0, 1.0]
         terminated : bool        True if satellite is fully isolated
         truncated  : bool        True after T steps (end of orbital period)
         info       : dict        full diagnostic data for logging / analysis
@@ -377,33 +383,52 @@ class SatelliteEnv(gym.Env):
             I_switch    = 1 if target_sat_id ≠ prev_sat_id (physical handover)
                           0 if same satellite or first connection (_prev_nbr == -1)
             ETA_S       = 3.0 s  (PAT acquisition delay)
-            GS_BONUS    = +5.0 if ≥1 ground station visible at target sat,
+            GS_BONUS    = +0.5 if ≥1 ground station visible at target sat,
                            0.0 otherwise
 
         Phase 3.5 — LRL Death Penalty
         ──────────────────────────────
         If the agent's previously-active link has LRL = 0 at the current
-        timestep (the physical link just broke), R = -50.0 regardless
-        of the chosen action.  This forces proactive handovers before
-        link breakage occurs.
+        timestep (the physical link just broke), R = -500.0 regardless
+        of the chosen action.  This makes link death catastrophic and
+        forces proactive handovers well before link breakage occurs.
         """
         action = int(action)
+        assert 0 <= action < N_NEIGHBORS, (
+            f"Invalid action index: {action} — must be in [0, {N_NEIGHBORS})"
+        )
         t  = self._t
         i  = self._current_sat
         target_sat_id = int(self._slot_j[action])   # physical satellite ID (-1 if padded)
 
-        # ── Phase 3.5: LRL Death Penalty ──────────────────────────────────────
-        # If the agent was connected to a neighbour and that link's LRL has
-        # reached 0 at the current timestep, the physical ISL just broke.
-        # Apply a massive penalty to teach proactive switching.
+        # ── Step 1: Process the action FIRST (switch before death check) ──────
+        # Capture the old link before any state mutation so the death check
+        # below can reference it regardless of what the action does.
+        old_prev_nbr = self._prev_nbr
+
+        # A valid switch means the agent chose a real (non-padded) satellite
+        # different from the one it was already on.  We commit this switch
+        # immediately so that if the old link has simultaneously died, the
+        # agent is NOT penalised — it successfully routed around the failure.
+        is_valid_switch = (
+            target_sat_id != -1              # not a padded slot
+            and target_sat_id != old_prev_nbr  # genuinely switching, not staying
+        )
+        if is_valid_switch:
+            self._prev_nbr = target_sat_id   # commit switch before death check
+
+        # ── Step 2: LRL Death Penalty ─────────────────────────────────────────
+        # Death fires only when the agent's OLD link has LRL = 0 AND the agent
+        # did NOT escape to a new satellite this step.  If the agent switched
+        # away in the same step the link broke, the switch absorbs the failure
+        # — no penalty applies (proactive re-routing succeeded).
         lrl_death = False
-        if self._prev_nbr >= 0:
-            prev_lrl = float(self.lrl_s[t, i, self._prev_nbr])
+        if old_prev_nbr >= 0 and not is_valid_switch:
+            prev_lrl = float(self.lrl_s[t, i, old_prev_nbr])
             if prev_lrl <= 0.0:
                 lrl_death = True
 
         if lrl_death:
-            broken_sat     = self._prev_nbr   # save before overwriting
             self._prev_nbr = -1               # link is broken; no active connection
             self._t       += 1
             truncated  = (self._t >= self.T)
@@ -423,7 +448,7 @@ class SatelliteEnv(gym.Env):
                     self._t, i,
                     event="lrl_death_penalty",
                     reward=R_LRL_DEATH,
-                    broken_link=broken_sat,
+                    broken_link=old_prev_nbr,
                 ),
             )
 
@@ -471,17 +496,20 @@ class SatelliteEnv(gym.Env):
         # between slots as neighbours drift in/out of range.  Comparing IDs
         # ensures the agent is only penalised for genuine physical handovers.
         # First connection of an episode (_prev_nbr == -1) is never a switch.
-        if self._prev_nbr < 0:
+        # IMPORTANT: use old_prev_nbr (captured before any state mutation),
+        # NOT self._prev_nbr — the Bug 1 fix may have already committed
+        # self._prev_nbr = target_sat_id, which would always give I_switch = 0.
+        if old_prev_nbr < 0:
             I_switch = 0.0                             # first connection
-        elif target_sat_id != self._prev_nbr:
+        elif target_sat_id != old_prev_nbr:
             I_switch = 1.0                             # physical handover
         else:
             I_switch = 0.0                             # same satellite
 
         # ── Ground Station Bonus ──────────────────────────────────────────────
         # Computed at decision time t so the bonus is consistent with the
-        # latency / switch penalty terms above.  +5.0 explicitly incentivises
-        # the agent to route through GS-reachable satellites.
+        # latency / switch penalty terms above.  +0.5 learnable incentive —
+        # flips quiet stay-steps from negative to positive when GS is visible.
         target_gs = [
             city for city, mask in self.gsl_masks.items()
             if mask[t, target_sat_id]
@@ -511,6 +539,7 @@ class SatelliteEnv(gym.Env):
         # ── Diagnostics ───────────────────────────────────────────────────────
         info = self._get_info(
             self._t, i,
+            event="normal",
             selected_sat=target_sat_id,
             slot_chosen=action,
             dist_km=round(dist_val, 3),
@@ -553,12 +582,13 @@ class SatelliteEnv(gym.Env):
                 rows.append("  │   {:d}   │  ---  │   ---   │   ---   │  ---   │".format(k))
             else:
                 flag    = " ◄ active" if j == self._prev_nbr else ""
+                # r is √(lrl/LRL_HEALTH_HORIZON), so true LRL = r² × horizon
                 rows.append(
                     "  │   {:d}   │ {:5s} │ {:7.1f} │ {:7.0f} │  {:3s}   │{}".format(
                         k,
                         f"s{j:02d}",
                         d * self.max_isl_km,
-                        r * LRL_HEALTH_HORIZON,
+                        (r ** 2) * LRL_HEALTH_HORIZON,
                         "yes" if c > 0.5 else "no",
                         flag,
                     )
@@ -603,7 +633,7 @@ def _run_smoke_test(topo_path: Path) -> None:
     print("[1/7]  reset(seed=42) …")
     obs, info = env.reset(seed=42)
     print(f"       obs.shape={obs.shape}  obs.dtype={obs.dtype}")
-    print(f"       obs (slot 0) : dist={obs[0]:.4f}  lrl={obs[1]:.4f}  "
+    print(f"       obs (slot 0) : dist={obs[0]:.4f}  lrl(√)={obs[1]:.4f}  "
           f"is_conn={obs[2]:.1f}")
     print(f"       current_sat  : {info['current_sat']}")
     print(f"       visible_gs   : {info['visible_gs']}")

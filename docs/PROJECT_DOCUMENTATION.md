@@ -407,7 +407,7 @@ The environment models a **single-node routing decision** at one satellite in th
 | Episode length | 86,400 steps (24h orbital period) |
 | Termination | Satellite becomes completely isolated (0 live links) |
 | Truncation | t ≥ 86,400 |
-| Reward range | [−50, 0] |
+| Reward range | [−500, 1] |
 
 ### 6.2 Observation Space
 
@@ -415,7 +415,7 @@ The observation is a `(24,)` float32 vector — **8 neighbour slots × 3 feature
 
 ```
 obs[k*3 + 0]  norm_distance  ∈ [0, 1]     dist_km / max_isl_km
-obs[k*3 + 1]  norm_lrl       ∈ [0, 1]     clip(lrl_s, 0, 60) / 60  (health bar)
+obs[k*3 + 1]  norm_lrl       ∈ [0, 1]     √(clip(lrl_s, 0, 60) / 60)  (health bar)
 obs[k*3 + 2]  is_connected   ∈ {0.0, 1.0} 1 if this satellite was chosen last step
 ```
 
@@ -423,10 +423,10 @@ obs[k*3 + 2]  is_connected   ∈ {0.0, 1.0} 1 if this satellite was chosen last 
 
 **Slot ordering:** Slots are sorted by **ascending satellite ID** (Phase 3.5 fix). The 8 lowest-ID connected neighbours of the controlled satellite occupy slots 0–7. Slots beyond the live neighbour count are padded.
 
-**LRL health-bar (Phase 3.5 fix):** The raw LRL is clipped to a 60-second horizon before normalising:
+**LRL health-bar (Phase 3.5 fix):** The raw LRL is clipped to a 60-second horizon, normalised, then sqrt-transformed:
 
 ```python
-norm_lrl = clip(lrl_s, 0, 60) / 60
+norm_lrl = sqrt(clip(lrl_s, 0, 60) / 60)
 ```
 
 This amplifies the danger signal by 10× in the critical last-60-seconds zone (e.g., LRL=10s: old=0.017 → new=0.167).
@@ -447,7 +447,7 @@ Three distinct reward cases in priority order:
 #### Case 1: LRL Death Penalty (highest priority)
 ```
 If prev_nbr's LRL at current timestep == 0:
-    R = -50.0   (link just broke while agent was still on it)
+    R = -500.0   (link just broke while agent was still on it)
     prev_nbr reset to -1
 ```
 
@@ -472,12 +472,12 @@ $$I_{switch} = \begin{cases} 0 & \text{first connection (prev\_nbr = -1)} \\ 0 &
 | Latency weight | W₁ | 0.5 | Contribution of propagation delay to penalty |
 | Switching weight | W₂ | 1.0 | Multiplier on PAT setup delay |
 | PAT setup delay | η_s | 3.0 s | Physical cost of Pointing, Acquisition & Tracking |
-| LRL death penalty | R_LRL_DEATH | −50.0 | Link-breakage event penalty |
+| LRL death penalty | R_LRL_DEATH | −500.0 | Link-breakage event penalty |
 | Invalid action penalty | R_INVALID | −10.0 | Selecting padded slot |
-| Reward floor | REWARD_MIN | −50.0 | Clip lower bound |
-| Reward ceiling | REWARD_MAX | 0.0 | Clip upper bound |
+| Reward floor | REWARD_MIN | −500.0 | Clip lower bound |
+| Reward ceiling | REWARD_MAX | 1.0 | Clip upper bound |
 
-**Maximum normal reward magnitude:** W₁ × 1 + W₂ × η_s × 1 = 0.5 + 3.0 = 3.5 (clipped to max 3.5 below zero)
+**Maximum normal reward magnitude:** W₁ × 1 + W₂ × η_s × 1 = 0.5 + 3.0 = 3.5. With GS_BONUS = +0.5, best-case reward ≈ +0.25 (quiet step + GS visible), clipped to [−500, 1].
 
 ### 6.5 Environment Logic — Step by Step
 
@@ -549,7 +549,7 @@ The environment ships with a 7-test smoke test suite (`_run_smoke_test()`), all 
 | 4 | Reproducibility (seed=99 × 2 resets → identical obs) | ✅ PASS |
 | 5 | Invalid action penalty (−10, time advances) | ✅ PASS |
 | 6 | Randomised satellite selection (20 eps → >1 unique sat) | ✅ PASS |
-| 7 | Reward clipping (200 steps in [−50, 0]) | ✅ PASS |
+| 7 | Reward clipping (200 steps in [−500, 1]) | ✅ PASS |
 
 ---
 
@@ -597,8 +597,8 @@ nbr_idx = np.sort(nbr_idx)   # ascending satellite ID
 
 **New constant:**
 ```python
-R_LRL_DEATH = -50.0
-REWARD_MIN  = -50.0   # widened from -10.0
+R_LRL_DEATH = -500.0
+REWARD_MIN  = -500.0   # widened from -10.0
 ```
 
 **Logic inserted at top of `step()` (before invalid-action guard):**
@@ -609,7 +609,7 @@ if self._prev_nbr >= 0 and self.lrl_s[t, i, self._prev_nbr] <= 0:
     return ..., R_LRL_DEATH, ...
 ```
 
-The −50 penalty is 16× the maximum normal reward magnitude (3.5), making link breakage far worse than any routing suboptimality. This forces the agent to learn proactive switching.
+The −500 penalty is ~143× the maximum normal reward magnitude (3.5), making link breakage far worse than any routing suboptimality. This forces the agent to learn proactive switching.
 
 ### 7.4 Fix 3 — Randomised Starting Satellite
 
@@ -624,15 +624,15 @@ The −50 penalty is 16× the maximum normal reward magnitude (3.5), making link
 
 **Before:** `norm_lrl = lrl_s / 600.0` — full 600s range
 
-**After:** `norm_lrl = clip(lrl_s, 0, 60) / 60` — 60s health bar
+**After:** `norm_lrl = sqrt(clip(lrl_s, 0, 60) / 60)` — 60s health bar with sqrt transform
 
-| Raw LRL | Old norm | New norm | Signal amplification |
+| Raw LRL | Old norm | New norm (√) | Signal amplification |
 |---|---|---|---|
-| 10 s | 0.017 | 0.167 | **10×** |
-| 30 s | 0.050 | 0.500 | **10×** |
+| 10 s | 0.017 | 0.408 | **24×** |
+| 30 s | 0.050 | 0.707 | **14×** |
 | 300 s | 0.500 | 1.000 | — (clamped safe) |
 
-The 10× amplification in the danger zone (0–60s) gives the neural network a strong gradient for proactive switching.
+The sqrt transform provides even stronger amplification in the danger zone (0–60s) — up to 24× at LRL=10s — giving the neural network a strong gradient for proactive switching.
 
 ### 7.6 Fix 5 — Satellite-ID-Based Switch Logic
 
@@ -749,7 +749,7 @@ else:
 | `batch_size` | 64 | Mini-batch size for gradient updates |
 | `gamma` | 0.99 | Strong long-horizon credit assignment (86,400 steps) |
 | `ent_coef` | 0.01 | Encourages exploration over full 24h orbit |
-| `total_timesteps` | 1,000,000 | ~11.6 full 86,400-step episodes |
+| `total_timesteps` | 3,000,000 | ~34.7 full 86,400-step episodes |
 | `n_updates` | 4,880 | Total gradient update steps |
 | `seed` | 42 | Academic reproducibility |
 | `policy` | MlpPolicy | Fully-connected neural network |
@@ -771,7 +771,7 @@ train()
 │   ├── HardwareMonitorCallback(log_freq=20k)
 │   ├── CheckpointCallback(save_freq=100k)
 │   └── MarkdownTrackerCallback → docs/TRAINING_LOG.md
-├── model.learn(total_timesteps=1_000_000)
+├── model.learn(total_timesteps=3_000_000)
 ├── model.save("models/stability_ppo_m4")
 ├── evaluate(model, n_episodes=5)    # 5 × 86,400-step eval
 └── md_callback.finalize(results)    # write final TRAINING_LOG.md
@@ -955,7 +955,7 @@ MPS is available but unused. The `select_device()` function detects MPS and logs
 
 ### Interpretation
 
-1. **Zero LRL death events** — The agent successfully learned to proactively switch links before breakage. The −50 LRL death penalty was effective.
+1. **Zero LRL death events** — The agent successfully learned to proactively switch links before breakage. The −500 LRL death penalty was effective.
 
 2. **Zero invalid actions** — The agent always selects a valid (non-padded) slot. It has learned the slot structure.
 
@@ -980,7 +980,7 @@ MPS is available but unused. The `select_device()` function detects MPS and logs
 |---|---|---|
 | **Check 1** — Phase 1 physics & timing | timestamp count (86,400), sequential ordering, LRL DP recurrence | ✅ PASS |
 | **Check 2** — Phase 2 MDP state | obs shape (24,), obs range [−1, 1], visible_gs type | ✅ PASS |
-| **Check 3** — Phase 2 reward | LRL death = −50, invalid = −10, normal formula, clipping | ✅ PASS |
+| **Check 3** — Phase 2 reward | LRL death = −500, invalid = −10, normal formula, clipping | ✅ PASS |
 
 **Additional model health check:**  
 `src/check_model_health.py` — loads `stability_ppo_m4.zip`, runs inference on random observations, verifies action distribution is not collapsed.
@@ -1001,7 +1001,7 @@ MPS is available but unused. The `select_device()` function detects MPS and logs
 | Distances dtype | float16 [km] | float16 max 65,504 > max LEO dist 13,842 km |
 | Connectivity oracle | `lrl_s > 0` | Robust against any NPZ that stores raw distances |
 | Slot ordering | Ascending satellite ID | Breaks distance-exploitation shortcut |
-| LRL normalisation | 60s health bar | 10× signal amplification in danger zone |
+| LRL normalisation | 60s health bar + sqrt | Up to 24× signal amplification in danger zone |
 | First-connection switch | No penalty | Prevents spurious −3.0 on episode start |
 | Training device | CPU (not MPS) | 4–15× faster for small MlpPolicy |
 | current_sat | −1 (random) | Universal decentralised policy claim |
@@ -1176,9 +1176,9 @@ W1                  = 0.5      # latency weight
 W2                  = 1.0      # switching weight
 ETA_S               = 3.0      # PAT setup delay [s]
 R_INVALID           = -10.0    # padded slot penalty
-R_LRL_DEATH         = -50.0    # link-breakage penalty
-REWARD_MIN          = -50.0
-REWARD_MAX          = 0.0
+R_LRL_DEATH         = -500.0   # link-breakage penalty
+REWARD_MIN          = -500.0
+REWARD_MAX          = 1.0
 
 # LRL health bar
 LRL_HEALTH_HORIZON  = 60.0     # seconds
@@ -1214,10 +1214,10 @@ I_switch    = 1   (sat_22 ≠ sat_15, genuine handover)
 raw_reward  = -(0.5 × 0.5329 + 1.0 × 3.0 × 1)
             = -(0.2665 + 3.0)
             = -3.2665
-reward      = clip(-3.2665, -50, 0) = -3.2665
+reward      = clip(-3.2665, -500, 1) = -3.2665
 ```
 
-At the same timestep, sat_15's LRL is 45s (visible in obs as `norm_lrl = 45/60 = 0.75`). If the agent had stayed on sat_15, it would have 45 more seconds before the −50 death penalty. By switching, it avoids the future penalty at the cost of a one-time −3.27 switching cost.
+At the same timestep, sat_15's LRL is 45s (visible in obs as `norm_lrl = √(45/60) = 0.866`). If the agent had stayed on sat_15, it would have 45 more seconds before the −500 death penalty. By switching, it avoids the future penalty at the cost of a one-time −3.27 switching cost.
 
 ---
 
