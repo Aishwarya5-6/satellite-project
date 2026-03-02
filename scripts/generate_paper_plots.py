@@ -80,7 +80,7 @@ FIGURES_DIR   = PROJECT_ROOT / "paper_figures"
 
 EVAL_NPZ    = LOG_DIR  / "evaluations.npz"
 BEST_MODEL  = MODEL_DIR / "best_model.zip"
-FINAL_MODEL = MODEL_DIR / "stability_ppo_final.zip"
+FINAL_MODEL = MODEL_DIR / "stability_ppo_m4.zip"
 
 FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 

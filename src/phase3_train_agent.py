@@ -558,11 +558,21 @@ def evaluate(model: PPO, n_episodes: int = 5) -> dict:
 
 # ── Training Hyperparameters ──────────────────────────────────────────────────
 TOTAL_TIMESTEPS = 3_000_000
-LR              = 3e-4
-N_STEPS         = 2048
-BATCH_SIZE      = 64
+LR              = 3e-4          # Peak LR — linearly annealed to 0
+N_STEPS         = 4096          # Rollout length (was 2048 — more stable gradients)
+BATCH_SIZE      = 256           # Mini-batch size (was 64 — lower variance)
 GAMMA           = 0.99
-ENT_COEF        = 0.01          # encourage exploration over 24 h orbit
+GAE_LAMBDA      = 0.98          # GAE λ (was default 0.95 — better long-horizon credit)
+ENT_COEF        = 0.05          # Entropy bonus (was 0.03 → collapsed; 0.05 sustains exploration)
+N_EPOCHS        = 3             # PPO epochs per rollout (default 10 caused entropy collapse)
+TARGET_KL       = 0.02          # Early-stop epoch if KL exceeds this — emergency brake
+
+
+def linear_schedule(initial_value: float):
+    """Linear learning-rate annealing: value × progress_remaining (1→0)."""
+    def func(progress_remaining: float) -> float:
+        return progress_remaining * initial_value
+    return func
 
 
 def train() -> None:
@@ -602,11 +612,15 @@ def train() -> None:
     # ── 3. Print hyperparameters ──────────────────────────────────────────────
     print("  Hyperparameters")
     print("  ┌─────────────────────────────────────────┐")
-    print(f"  │  {'learning_rate':20s} = {LR:<18}│")
+    print(f"  │  {'learning_rate':20s} = {f'{LR} → 0 (linear)':18s}│")
     print(f"  │  {'n_steps':20s} = {N_STEPS:<18}│")
     print(f"  │  {'batch_size':20s} = {BATCH_SIZE:<18}│")
+    print(f"  │  {'n_epochs':20s} = {N_EPOCHS:<18}│")
     print(f"  │  {'gamma':20s} = {GAMMA:<18}│")
+    print(f"  │  {'gae_lambda':20s} = {GAE_LAMBDA:<18}│")
     print(f"  │  {'ent_coef':20s} = {ENT_COEF:<18}│")
+    print(f"  │  {'target_kl':20s} = {TARGET_KL:<18}│")
+    print(f"  │  {'max_grad_norm':20s} = {0.5:<18}│")
     print(f"  │  {'total_timesteps':20s} = {TOTAL_TIMESTEPS:<18,}│")
     print(f"  │  {'device':20s} = {device:<18}│")
     print(f"  │  {'policy':20s} = {'MlpPolicy':<18}│")
@@ -618,11 +632,15 @@ def train() -> None:
     model = PPO(
         policy="MlpPolicy",
         env=train_env,
-        learning_rate=LR,
+        learning_rate=linear_schedule(LR),
         n_steps=N_STEPS,
         batch_size=BATCH_SIZE,
+        n_epochs=N_EPOCHS,
         gamma=GAMMA,
+        gae_lambda=GAE_LAMBDA,
         ent_coef=ENT_COEF,
+        target_kl=TARGET_KL,
+        max_grad_norm=0.5,
         verbose=1,
         device=device,
         tensorboard_log=str(LOG_DIR),
@@ -654,16 +672,21 @@ def train() -> None:
         eval_cb=eval_callback,
         n_eval_episodes=5,
         hyperparams={
-            "learning_rate":    LR,
+            "learning_rate":    f"{LR} → 0 (linear annealing)",
             "n_steps":          N_STEPS,
             "batch_size":       BATCH_SIZE,
+            "n_epochs":         N_EPOCHS,
             "gamma":            GAMMA,
+            "gae_lambda":       GAE_LAMBDA,
             "ent_coef":         ENT_COEF,
+            "target_kl":        TARGET_KL,
+            "max_grad_norm":    0.5,
             "total_timesteps":  f"{TOTAL_TIMESTEPS:,}",
             "policy":           "MlpPolicy",
             "obs_dim":          24,
             "action_space":     "Discrete(8)",
             "reward_range":     "[-500.0, 1.0]",
+            "eta_s":            1.0,
             "gs_bonus":         0.5,
             "lrl_transform":    "sqrt(clip(lrl,0,60)/60)",
             "n_ground_stations": 24,
@@ -678,7 +701,7 @@ def train() -> None:
     # ── 6. Launch training ────────────────────────────────────────────────────
     print("─" * 72)
     print(f"  Ready to train for {TOTAL_TIMESTEPS:,} timesteps.")
-    print(f"  Estimated time: ~40 min on Apple M4.")
+    print(f"  Estimated time: ~45 min on Apple M4.")
     print("─" * 72)
     print(f"  ✓ Launching training loop\n")
 

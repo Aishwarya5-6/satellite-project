@@ -48,7 +48,8 @@ C_LIGHT_KM_S       = 299_792.458  # Speed of light                  [km s⁻¹]
 # ── Reward Hyperparameters ────────────────────────────────────────────────────
 W1         = 0.5    # Latency weight
 W2         = 1.0    # Switching weight
-ETA_S      = 3.0    # PAT setup delay                              [s]
+ETA_S      = 1.0    # PAT setup delay  (was 3.0 — reduced to make switching
+                     # viable: break-even ≈ 10 steps vs 30+ before)      [s]
 R_INVALID   =  -10.0    # Penalty for padded slot — 3× a handover, clearly less than death
 R_LRL_DEATH = -500.0    # Catastrophic penalty for link breakage — 50× an invalid action
 GS_BONUS    =    0.5    # Learnable incentive: flips quiet step from −0.25 to +0.25
@@ -382,7 +383,7 @@ class SatelliteEnv(gym.Env):
             NormLatency = dist_km / max_isl_km   ∈ [0, 1]
             I_switch    = 1 if target_sat_id ≠ prev_sat_id (physical handover)
                           0 if same satellite or first connection (_prev_nbr == -1)
-            ETA_S       = 3.0 s  (PAT acquisition delay)
+            ETA_S       = 1.0 s  (PAT acquisition delay)
             GS_BONUS    = +0.5 if ≥1 ground station visible at target sat,
                            0.0 otherwise
 
