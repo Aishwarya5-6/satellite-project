@@ -218,14 +218,23 @@ def check2_mdp_state(env: SatelliteEnv) -> None:
 
     print(f"\n  Controlled satellite : sat_{info['current_sat']:02d}")
     print(f"  Observation vector   : {np.round(obs, 4)}")
-    print(f"  Reshaped (4×3):")
+    print(f"  Reshaped ({N_NEIGHBORS}×{N_FEATURES}):")
     obs_2d = obs.reshape(N_NEIGHBORS, N_FEATURES)
-    print(f"  {'Slot':>5}  {'norm_dist':>10}  {'norm_lrl':>10}  {'is_conn':>8}")
-    print(f"  {'─────':>5}  {'─────────':>10}  {'────────':>10}  {'───────':>8}")
-    for k in range(N_NEIGHBORS):
-        d, r, c = obs_2d[k]
-        label = "(padded)" if d < 0 else ""
-        print(f"  {k:>5}  {d:>10.4f}  {r:>10.4f}  {c:>8.1f}  {label}")
+
+    if N_FEATURES == 4:
+        print(f"  {'Slot':>5}  {'norm_dist':>10}  {'norm_lrl':>10}  {'is_conn':>8}  {'congestion':>11}")
+        print(f"  {'─────':>5}  {'─────────':>10}  {'────────':>10}  {'───────':>8}  {'──────────':>11}")
+        for k in range(N_NEIGHBORS):
+            d, r, c, cg = obs_2d[k]
+            label = "(padded)" if d < 0 else ""
+            print(f"  {k:>5}  {d:>10.4f}  {r:>10.4f}  {c:>8.1f}  {cg:>11.4f}  {label}")
+    else:
+        print(f"  {'Slot':>5}  {'norm_dist':>10}  {'norm_lrl':>10}  {'is_conn':>8}")
+        print(f"  {'─────':>5}  {'─────────':>10}  {'────────':>10}  {'───────':>8}")
+        for k in range(N_NEIGHBORS):
+            d, r, c = obs_2d[k, 0], obs_2d[k, 1], obs_2d[k, 2]
+            label = "(padded)" if d < 0 else ""
+            print(f"  {k:>5}  {d:>10.4f}  {r:>10.4f}  {c:>8.1f}  {label}")
 
     # ── 2a · Bounds check ─────────────────────────────────────────────────────
     print(f"\n  [2a]  Observation bounds check  (all values ∈ [{OBS_LOW}, {OBS_HIGH}]) …")
@@ -307,48 +316,52 @@ def check3_reward_mechanism(env: SatelliteEnv) -> None:
     # ── Step A: Valid action, link maintained ─────────────────────────────────
     print(f"\n  [3a]  Step A — Valid slot {slot_a}, first selection (expect latency cost only)")
 
-    # Step once to establish the link (I_switch=1 on first step)
+    # Step once to establish the link
     _, r_first, _, _, info_first = env.step(slot_a)
     dist_a = info_first.get("dist_km", 0.0)
+    cong_first = info_first.get("congestion", 0.0)
+    cong_pen_first = info_first.get("congestion_penalty", 0.0)
     print(f"         First selection: slot={slot_a}  dist={dist_a} km  "
-          f"reward={r_first:.4f}  I_switch={info_first.get('I_switch')}")
+          f"reward={r_first:.4f}  I_switch={info_first.get('I_switch')}  "
+          f"cong={cong_first:.3f}  cong_pen={cong_pen_first}")
 
     # Step again on the same slot (I_switch=0, latency only)
     obs2, r_a, _, _, info_a = env.step(slot_a)
     obs2_2d  = obs2.reshape(N_NEIGHBORS, N_FEATURES)
     dist_a2  = info_a.get("dist_km", 0.0)
+    cong_a   = info_a.get("congestion", 0.0)
+    cong_pen_a = info_a.get("congestion_penalty", 0.0)
 
-    # The env computes reward using the normalised distance from the obs vector,
-    # NOT by re-dividing dist_km by MAX_ISL_KM.  Detect which formula is used:
-    norm_dist_a = obs2_2d[slot_a, 0]
-    expected_via_obs    = -(W1 * norm_dist_a)                    # R = -W1 * norm_dist
-    expected_via_raw_km = -(W1 * (dist_a2 / MAX_ISL_KM))        # R = -W1 * (dist/MAX)
+    # The env uses norm_dist from the obs vector for reward
+    norm_dist_a = obs2_2d[slot_a, 0] if slot_a < obs2_2d.shape[0] and obs2_2d[slot_a, 0] >= 0 else dist_a2 / MAX_ISL_KM
+    # Account for GS bonus and congestion penalty from info
+    gs_bonus_a = 0.5 if len(info_a.get("target_visible_gs", [])) > 0 else 0.0
+
+    expected_via_obs = -(W1 * norm_dist_a) + gs_bonus_a + cong_pen_a
+    expected_via_raw = -(W1 * (dist_a2 / MAX_ISL_KM)) + gs_bonus_a + cong_pen_a
     tol = 1e-3
 
-    # Pick whichever formula matches the actual reward
     if abs(r_a - expected_via_obs) < tol:
         expected_r_a = expected_via_obs
         reward_mode  = "norm_dist from obs"
-    elif abs(r_a - expected_via_raw_km) < tol:
-        expected_r_a = expected_via_raw_km
+    elif abs(r_a - expected_via_raw) < tol:
+        expected_r_a = expected_via_raw
         reward_mode  = "dist_km / MAX_ISL_KM"
     else:
-        expected_r_a = expected_via_obs  # default for reporting
+        expected_r_a = expected_via_obs
         reward_mode  = "UNKNOWN"
 
     print(f"         Maintained link: slot={slot_a}  dist={dist_a2} km  "
-          f"norm_dist={norm_dist_a:.4f}")
+          f"norm_dist={norm_dist_a:.4f}  cong={cong_a:.3f}  cong_pen={cong_pen_a}")
     print(f"         reward={r_a:.4f}  expected≈{expected_r_a:.4f}  "
           f"(mode: {reward_mode})")
 
     if (info_a.get("I_switch") == 0
-            and r_a < 0.0
             and abs(r_a - expected_r_a) < tol):
         _pass("3a-latency",
               f"Latency-only reward correct: R={r_a:.4f}  I_switch=0",
-              f"norm_dist={norm_dist_a:.4f}  W1={W1}  "
-              f"R = −({W1}×{norm_dist_a:.4f}) = {expected_r_a:.4f}  "
-              f"[{reward_mode}]")
+              f"norm_dist={norm_dist_a:.4f}  W1={W1}  gs_bonus={gs_bonus_a}  "
+              f"cong_pen={cong_pen_a}  [{reward_mode}]")
     else:
         _fail("3a-latency",
               f"Latency-only reward wrong: got {r_a:.4f}, expected ≈{expected_r_a:.4f}",
@@ -367,41 +380,38 @@ def check3_reward_mechanism(env: SatelliteEnv) -> None:
 
         _, r_b, _, _, info_b = env.step(slot_b)
         dist_b_actual = info_b.get("dist_km", 0.0)
+        cong_b = info_b.get("congestion", 0.0)
+        cong_pen_b = info_b.get("congestion_penalty", 0.0)
+        gs_bonus_b = 0.5 if len(info_b.get("target_visible_gs", [])) > 0 else 0.0
 
-        # Use the same reward mode detected in step A
         if reward_mode == "norm_dist from obs":
-            expected_r_b = -(W1 * norm_dist_b + W2 * ETA_S * 1)
+            expected_r_b = -(W1 * norm_dist_b + W2 * ETA_S * 1) + gs_bonus_b + cong_pen_b
         else:
-            expected_r_b = -(W1 * (dist_b_actual / MAX_ISL_KM) + W2 * ETA_S * 1)
+            expected_r_b = -(W1 * (dist_b_actual / MAX_ISL_KM) + W2 * ETA_S * 1) + gs_bonus_b + cong_pen_b
 
         print(f"         Switched link : slot={slot_b}  dist={dist_b_actual} km  "
-              f"norm_dist={norm_dist_b:.4f}")
+              f"norm_dist={norm_dist_b:.4f}  cong={cong_b:.3f}  cong_pen={cong_pen_b}")
         print(f"         reward={r_b:.4f}  expected≈{expected_r_b:.4f}")
 
-        switch_penalty_present = r_b < r_a
-        formula_correct        = abs(r_b - expected_r_b) < tol
-        is_switch              = info_b.get("I_switch") == 1
+        formula_correct = abs(r_b - expected_r_b) < tol
+        is_switch       = info_b.get("I_switch") == 1
 
-        if switch_penalty_present and is_switch and formula_correct:
+        if is_switch and formula_correct:
             _pass("3b-switch",
                   f"Switch penalty applied correctly: R={r_b:.4f}  I_switch=1",
-                  f"Latency term={W1 * norm_dist_b:.4f}  "
-                  f"PAT term={W2 * ETA_S:.1f}  "
-                  f"Total={expected_r_b:.4f}  [{reward_mode}]")
+                  f"Latency={W1 * norm_dist_b:.4f}  PAT={W2 * ETA_S:.1f}  "
+                  f"gs_bonus={gs_bonus_b}  cong_pen={cong_pen_b}  [{reward_mode}]")
         else:
             _fail("3b-switch",
                   f"Switch reward wrong: got {r_b:.4f}, expected ≈{expected_r_b:.4f}",
-                  f"I_switch={info_b.get('I_switch')}  "
-                  f"more_negative={switch_penalty_present}  mode={reward_mode}")
+                  f"I_switch={info_b.get('I_switch')}  mode={reward_mode}")
 
-    # ── Step C: Invalid (padded) slot ─────────────────────────────────────────
+    # ── Step C: Invalid (padded) slot — unchanged logic ───────────────────────
     print(f"\n  [3c]  Step C — Padded slot (expect exactly {R_INVALID})")
 
     if slot_invalid is None:
         _pass("3c-invalid",
-              "All 4 slots are active at this timestep — invalid-action test uses "
-              "a fresh reset where padding is confirmed")
-        # Re-run with a satellite/time that guarantees padding
+              "All slots active — invalid-action test uses fresh reset")
         obs_pad, _ = env.reset(seed=42)
         obs_pad_2d = obs_pad.reshape(N_NEIGHBORS, N_FEATURES)
         padded_fresh = [k for k in range(N_NEIGHBORS) if obs_pad_2d[k, 0] < 0.0]
@@ -420,8 +430,7 @@ def check3_reward_mechanism(env: SatelliteEnv) -> None:
         if r_c == R_INVALID and info_c.get("event") == "invalid_action_penalty":
             _pass("3c-invalid",
                   f"Invalid-action penalty is exactly {R_INVALID}  ✓",
-                  f"Time advanced: t {t_before}→{t_after}  "
-                  f"(physical time always passes)")
+                  f"Time advanced: t {t_before}→{t_after}")
         else:
             _fail("3c-invalid",
                   f"Wrong penalty: got {r_c}, expected {R_INVALID}",

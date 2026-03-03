@@ -16,10 +16,10 @@ satellite and selects which slot to route through. The reward penalises
 propagation latency and costly PAT (Pointing, Acquisition & Tracking)
 handovers when the agent switches links.
 
-Observation Space  :  Box(-1, 1, shape=(24,), dtype=float32)
-                       8 neighbour slots × 3 features
+Observation Space  :  Box(-1, 1, shape=(32,), dtype=float32)
+                       8 neighbour slots × 4 features
 Action Space       :  Discrete(8)  — slot index to select
-Reward             :  R = -(w1·NormLatency + w2·η_s·I_switch) + GS_BONUS  ∈ [-500, 1]
+Reward             :  R = -(w1·NormLatency + w2·η_s·I_switch) + GS_BONUS + CongPenalty  ∈ [-500, 1]
 
 ================================================================================
 """
@@ -34,8 +34,8 @@ import gymnasium as gym
 
 # ── Observation Layout ────────────────────────────────────────────────────────
 N_NEIGHBORS = 8          # Raised from 4 → 8: prevents truncation blindspots
-N_FEATURES  = 3          # [norm_distance, norm_lrl, is_connected]
-OBS_DIM     = N_NEIGHBORS * N_FEATURES   # 24
+N_FEATURES  = 4          # [norm_distance, norm_lrl, is_connected, congestion]
+OBS_DIM     = N_NEIGHBORS * N_FEATURES   # 32
 
 # ── Physical & Constellation Constants ───────────────────────────────────────
 N_SATS       = 60
@@ -67,6 +67,7 @@ class SatelliteEnv(gym.Env):
     • Slots are **sorted by satellite ID** (not distance).
     • **LRL Death Penalty** (−500) on link breakage.
     • **Randomised starting satellite** each episode.
+    • **Network congestion** per-node dynamic state + penalty.
 
     Parameters
     ----------
@@ -79,14 +80,15 @@ class SatelliteEnv(gym.Env):
     render_mode   : str | None
         ``"ansi"`` for a text-based console render; ``None`` to disable.
 
-    Observation — shape (24,) float32
+    Observation — shape (32,) float32
     ──────────────────────────────────
     Slot k  (k = 0 … 7, sorted by **ascending satellite ID**):
-        obs[k*3 + 0]  norm_distance  ∈ [0, 1]    dist_km / max_isl_km
-        obs[k*3 + 1]  norm_lrl       ∈ [0, 1]    √(clip(lrl_s, 0, 60) / 60)
-        obs[k*3 + 2]  is_connected   ∈ {0.0, 1.0} 1 if this sat was chosen
+        obs[k*4 + 0]  norm_distance  ∈ [0, 1]    dist_km / max_isl_km
+        obs[k*4 + 1]  norm_lrl       ∈ [0, 1]    √(clip(lrl_s, 0, 60) / 60)
+        obs[k*4 + 2]  is_connected   ∈ {0.0, 1.0} 1 if this sat was chosen
                                                    in the previous step
-    Padded (empty) slots: all three features set to -1.0.
+        obs[k*4 + 3]  congestion     ∈ [0, 1]    congestion level of the neighbour
+    Padded (empty) slots: all four features set to -1.0.
 
     Action — Discrete(8)
     ─────────────────────
@@ -94,13 +96,15 @@ class SatelliteEnv(gym.Env):
 
     Reward
     ──────
-    R = -(w1 · NormLatency  +  w2 · η_s · I_switch)  +  GS_BONUS,  clipped to [-500, 1]
+    R = -(w1 · NormLatency  +  w2 · η_s · I_switch)  +  GS_BONUS  +  CongPenalty,
+    clipped to [-500, 1]
 
     GS Bonus:  +0.5 if the chosen satellite has ≥1 ground station visible
-               at the current timestep (flips quiet steps positive — learnable signal).
+               at the current timestep.
 
-    LRL Death Penalty:  if the agent's active link has LRL = 0 at the
-    current timestep (link just broke), reward = -500.0.
+    Congestion Penalty: -2.0 if target node congestion > 0.8.
+
+    LRL Death Penalty:  if the agent's active link has LRL = 0 → reward = -500.0.
 
     Invalid action (padded slot) → reward = -10.0.
     """
@@ -126,8 +130,13 @@ class SatelliteEnv(gym.Env):
         # ── Load topology into dense NumPy tensors ────────────────────────────
         self._load_topology()
 
+        # ── Per-node congestion state ─────────────────────────────────────────
+        self.node_congestion = np.random.default_rng(42).uniform(
+            0.0, 1.0, size=N_SATS
+        ).astype(np.float32)
+
         # ── Gymnasium spaces ──────────────────────────────────────────────────
-        #   Observation: 8 slots × 3 features; padding uses -1.0 → low = -1.0
+        #   Observation: 8 slots × 4 features; padding uses -1.0 → low = -1.0
         self.observation_space = gym.spaces.Box(
             low=-1.0, high=1.0,
             shape=(OBS_DIM,),
@@ -255,7 +264,7 @@ class SatelliteEnv(gym.Env):
 
         Returns
         -------
-        obs  : np.ndarray, shape (24,), float32
+        obs  : np.ndarray, shape (32,), float32
         info : dict
         """
         # CRITICAL: call super().reset(seed=seed) first so self.np_random is
@@ -278,6 +287,10 @@ class SatelliteEnv(gym.Env):
             # Random satellite: uniform draw from [0, N_SATS)
             self._current_sat = int(self.np_random.integers(0, N_SATS))
 
+        # ── Re-randomise congestion on reset ──────────────────────────────────
+        rng = np.random.default_rng(seed)
+        self.node_congestion = rng.uniform(0.0, 1.0, size=N_SATS).astype(np.float32)
+
         obs  = self._get_obs()
         info = self._get_info(
             0, self._current_sat,
@@ -292,65 +305,51 @@ class SatelliteEnv(gym.Env):
 
     def _get_obs(self) -> np.ndarray:
         """
-        Build the (24,) observation vector for the controlled satellite at t.
-
-        Phase 3.5:  neighbours are sorted by **ascending satellite ID**,
-        NOT by distance.  This prevents the agent from exploiting slot
-        ordering as a proxy for latency.
-
-        Vectorisation strategy
-        ──────────────────────
-          Step 1  Slice dist_km[t, i] → (N,) row fetch           O(N)
-          Step 2  np.where(connected) → neighbour index array     O(N)
-          Step 3  np.sort on satellite ID (already ascending)     O(k)
-          Step 4  Array index: dist[vj] / MAX, √(lrl[vj] / MAX)   O(k)
-          Step 5  Broadcast is_connected comparison vj==prev_nbr  O(k)
-
-        Returns
-        -------
-        obs : np.ndarray  shape (24,)  float32
-              Flattened (8, 3) matrix; padded slots filled with -1.0.
+        Build the (32,) observation vector for the controlled satellite at t.
+        8 slots × 4 features: [norm_dist, norm_lrl, is_connected, congestion]
         """
         t = self._t
         i = self._current_sat
 
         # ── Step 1 & 2: row slice + connectivity mask ─────────────────────────
-        dist_row = self.dist_km[t, i]          # (N,) float32
-        lrl_row  = self.lrl_s[t, i]            # (N,) float32
-        nbr_idx  = np.where(self.connected[t, i])[0]   # indices of live links
+        dist_row = self.dist_km[t, i]
+        lrl_row  = self.lrl_s[t, i]
+        nbr_idx  = np.where(self.connected[t, i])[0]
 
         # ── Step 3: sort by ascending satellite ID, keep top-8 ───────────────
-        #   Phase 3.5: np.where already returns sorted indices, but we call
-        #   np.sort explicitly for clarity.  Slot 0 = lowest sat ID.
         if nbr_idx.size > 0:
-            nbr_idx = np.sort(nbr_idx)                        # ID-sorted
-            nbr_idx = nbr_idx[:N_NEIGHBORS]                   # top-8
+            nbr_idx = np.sort(nbr_idx)
+            nbr_idx = nbr_idx[:N_NEIGHBORS]
 
-        n_valid = nbr_idx.size   # ∈ {0, 1, …, 8}
+        n_valid = nbr_idx.size
 
-        # ── Step 4 & 5: batch-normalise + is_connected flag ──────────────────
-        # Slot→satellite map: -1 marks empty padding slots
+        # ── Slot→satellite map: -1 marks empty padding slots ─────────────────
         slot_j = np.full(N_NEIGHBORS, -1, dtype=np.int64)
         slot_j[:n_valid] = nbr_idx
 
-        # Feature matrix  (N_NEIGHBORS, 3);  padding initialised to -1.0
+        # Feature matrix (N_NEIGHBORS, 4); padding initialised to -1.0
         obs = np.full((N_NEIGHBORS, N_FEATURES), -1.0, dtype=np.float32)
 
         if n_valid > 0:
-            vj = nbr_idx                                          # (n_valid,)
-            obs[:n_valid, 0] = dist_row[vj] / self.max_isl_km    # norm distance ∈ [0,1]
-            # √-transform: expands the signal near end-of-life so PPO
-            # perceives urgency sooner (linear 10% → √ 31.6%).
-            # Clip AFTER dividing so the argument to sqrt is always ≥ 1e-7,
-            # guarding against sqrt(negative) from floating-point drift.
-            # 1e-7 keeps the gradient 1/(2√x) ≤ ~1582 — well below instability.
-            linear_lrl = np.clip(lrl_row[vj] / LRL_HEALTH_HORIZON, 1e-7, 1.0)
-            obs[:n_valid, 1] = np.sqrt(linear_lrl).astype(np.float32)  # health-bar ∈ [0,1]
-            obs[:n_valid, 2] = (vj == self._prev_nbr).astype(np.float32)  # is_connected
+            valid_j = nbr_idx  # satellite indices of valid neighbours
 
-        # Cache for step() and render()
+            # Feature 0: normalised distance
+            obs[:n_valid, 0] = dist_row[valid_j] / self.max_isl_km
+
+            # Feature 1: normalised LRL (sqrt-compressed health bar)
+            raw_lrl = np.clip(lrl_row[valid_j], 0.0, LRL_HEALTH_HORIZON)
+            obs[:n_valid, 1] = np.sqrt(raw_lrl / LRL_HEALTH_HORIZON)
+
+            # Feature 2: is_connected flag (1.0 if this sat was chosen last step)
+            obs[:n_valid, 2] = np.where(valid_j == self._prev_nbr, 1.0, 0.0)
+
+            # Feature 3: congestion level of each neighbour satellite
+            obs[:n_valid, 3] = np.clip(self.node_congestion[valid_j], 0.0, 1.0)
+
+        # Padded slots already have all 4 features = -1.0 from np.full
+
         self._slot_j   = slot_j
-        self._last_obs = obs.ravel().astype(np.float32)  # explicit dtype guard
+        self._last_obs = obs.flatten()
         return self._last_obs.copy()
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -370,7 +369,7 @@ class SatelliteEnv(gym.Env):
 
         Returns
         -------
-        obs        : np.ndarray  (24,)  float32
+        obs        : np.ndarray  (32,)  float32
         reward     : float       ∈ [-500.0, 1.0]
         terminated : bool        True if satellite is fully isolated
         truncated  : bool        True after T steps (end of orbital period)
@@ -378,7 +377,7 @@ class SatelliteEnv(gym.Env):
 
         Reward formula
         ──────────────
-        R = -(W1 · NormLatency  +  W2 · ETA_S · I_switch)  +  GS_BONUS
+        R = -(W1 · NormLatency  +  W2 · ETA_S · I_switch)  +  GS_BONUS  +  CongPenalty
 
             NormLatency = dist_km / max_isl_km   ∈ [0, 1]
             I_switch    = 1 if target_sat_id ≠ prev_sat_id (physical handover)
@@ -386,6 +385,7 @@ class SatelliteEnv(gym.Env):
             ETA_S       = 1.0 s  (PAT acquisition delay)
             GS_BONUS    = +0.5 if ≥1 ground station visible at target sat,
                            0.0 otherwise
+            CongPenalty = -2.0 if target node congestion > 0.8
 
         Phase 3.5 — LRL Death Penalty
         ──────────────────────────────
@@ -400,29 +400,18 @@ class SatelliteEnv(gym.Env):
         )
         t  = self._t
         i  = self._current_sat
-        target_sat_id = int(self._slot_j[action])   # physical satellite ID (-1 if padded)
+        target_sat_id = int(self._slot_j[action])
 
-        # ── Step 1: Process the action FIRST (switch before death check) ──────
-        # Capture the old link before any state mutation so the death check
-        # below can reference it regardless of what the action does.
         old_prev_nbr = self._prev_nbr
 
-        # A valid switch means the agent chose a real (non-padded) satellite
-        # different from the one it was already on.  We commit this switch
-        # immediately so that if the old link has simultaneously died, the
-        # agent is NOT penalised — it successfully routed around the failure.
         is_valid_switch = (
-            target_sat_id != -1              # not a padded slot
-            and target_sat_id != old_prev_nbr  # genuinely switching, not staying
+            target_sat_id != -1
+            and target_sat_id != old_prev_nbr
         )
         if is_valid_switch:
-            self._prev_nbr = target_sat_id   # commit switch before death check
+            self._prev_nbr = target_sat_id
 
-        # ── Step 2: LRL Death Penalty ─────────────────────────────────────────
-        # Death fires only when the agent's OLD link has LRL = 0 AND the agent
-        # did NOT escape to a new satellite this step.  If the agent switched
-        # away in the same step the link broke, the switch absorbs the failure
-        # — no penalty applies (proactive re-routing succeeded).
+        # ── LRL Death Penalty ─────────────────────────────────────────────────
         lrl_death = False
         if old_prev_nbr >= 0 and not is_valid_switch:
             prev_lrl = float(self.lrl_s[t, i, old_prev_nbr])
@@ -430,8 +419,11 @@ class SatelliteEnv(gym.Env):
                 lrl_death = True
 
         if lrl_death:
-            self._prev_nbr = -1               # link is broken; no active connection
+            self._prev_nbr = -1
             self._t       += 1
+            # Evolve congestion
+            noise = self.np_random.normal(0.0, 0.02, size=N_SATS).astype(np.float32)
+            self.node_congestion = np.clip(self.node_congestion + noise, 0.0, 1.0)
             truncated  = (self._t >= self.T)
             terminated = False
             if truncated:
@@ -450,17 +442,17 @@ class SatelliteEnv(gym.Env):
                     event="lrl_death_penalty",
                     reward=R_LRL_DEATH,
                     broken_link=old_prev_nbr,
+                    congestion_penalty=0.0,
                 ),
             )
 
-        # ── Guard: invalid action (padded slot) ───────────────────────────────
-        # Time always advances (physical reality: 1 second passes regardless).
-        # The -10 penalty teaches the agent to avoid padded slots when valid
-        # ones exist; for fully isolated satellites every slot is padded and
-        # the penalty still applies, but the episode continues.
+        # ── Invalid action (padded slot) ──────────────────────────────────────
         if target_sat_id == -1:
-            self._prev_nbr = -1   # sever ghost link — no active ISL
+            self._prev_nbr = -1
             self._t   += 1
+            # Evolve congestion
+            noise = self.np_random.normal(0.0, 0.02, size=N_SATS).astype(np.float32)
+            self.node_congestion = np.clip(self.node_congestion + noise, 0.0, 1.0)
             truncated  = (self._t >= self.T)
             terminated = False
             if truncated:
@@ -478,53 +470,54 @@ class SatelliteEnv(gym.Env):
                     self._t, i,
                     event="invalid_action_penalty",
                     reward=R_INVALID,
+                    congestion_penalty=0.0,
                 ),
             )
 
-        # ── Reward computation (all NumPy scalar arithmetic) ──────────────────
+        # ── Reward computation ────────────────────────────────────────────────
         dist_val = float(self.dist_km[t, i, target_sat_id])
         lrl_val  = float(self.lrl_s[t, i, target_sat_id])
 
-        # Propagation latency, normalised against maximum ISL distance
-        #   actual_latency [s] = dist_km / c
-        #   norm_latency       = actual_latency / (max_isl_km / c)
-        #                      = dist_km / max_isl_km   (c cancels)
-        norm_latency = dist_val / self.max_isl_km     # ∈ [0, 1]
-        latency_ms   = (dist_val / C_LIGHT_KM_S) * 1e3  # for logging
+        norm_latency = dist_val / self.max_isl_km
+        latency_ms   = (dist_val / C_LIGHT_KM_S) * 1e3
 
-        # PAT switching indicator: based on physical satellite ID, NOT slot
-        # index.  Because slots are ID-sorted, the same satellite can shift
-        # between slots as neighbours drift in/out of range.  Comparing IDs
-        # ensures the agent is only penalised for genuine physical handovers.
-        # First connection of an episode (_prev_nbr == -1) is never a switch.
-        # IMPORTANT: use old_prev_nbr (captured before any state mutation),
-        # NOT self._prev_nbr — the Bug 1 fix may have already committed
-        # self._prev_nbr = target_sat_id, which would always give I_switch = 0.
         if old_prev_nbr < 0:
-            I_switch = 0.0                             # first connection
+            I_switch = 0.0
         elif target_sat_id != old_prev_nbr:
-            I_switch = 1.0                             # physical handover
+            I_switch = 1.0
         else:
-            I_switch = 0.0                             # same satellite
+            I_switch = 0.0
 
-        # ── Ground Station Bonus ──────────────────────────────────────────────
-        # Computed at decision time t so the bonus is consistent with the
-        # latency / switch penalty terms above.  +0.5 learnable incentive —
-        # flips quiet stay-steps from negative to positive when GS is visible.
         target_gs = [
             city for city, mask in self.gsl_masks.items()
             if mask[t, target_sat_id]
         ]
 
-        # Core reward — negative base; positive only when GS is visible
         raw_reward = -(W1 * norm_latency + W2 * ETA_S * I_switch)
         if len(target_gs) > 0:
             raw_reward += GS_BONUS
-        reward     = float(np.clip(raw_reward, REWARD_MIN, REWARD_MAX))
+
+        # ── Congestion penalty & latency inflation ────────────────────────────
+        congestion_penalty = 0.0
+        cong = float(self.node_congestion[target_sat_id])
+
+        if cong > 0.8:
+            congestion_penalty = -2.0
+
+        # Inflate latency to simulate queuing delay: 1× at cong=0, 3× at cong=1
+        queuing_multiplier = 1.0 + 2.0 * cong
+        latency_ms *= queuing_multiplier
+
+        raw_reward += congestion_penalty
+        reward = float(np.clip(raw_reward, REWARD_MIN, REWARD_MAX))
 
         # ── State advance ─────────────────────────────────────────────────────
         self._prev_nbr = target_sat_id
         self._t       += 1
+
+        # ── Evolve congestion via slow random walk ────────────────────────────
+        noise = self.np_random.normal(0.0, 0.02, size=N_SATS).astype(np.float32)
+        self.node_congestion = np.clip(self.node_congestion + noise, 0.0, 1.0)
 
         truncated  = (self._t >= self.T)
         terminated = False
@@ -533,7 +526,6 @@ class SatelliteEnv(gym.Env):
             obs = self._last_obs.copy()
         else:
             obs = self._get_obs()
-            # Terminate if the satellite becomes completely isolated
             if not self.connected[self._t, i].any():
                 terminated = True
 
@@ -551,6 +543,8 @@ class SatelliteEnv(gym.Env):
             raw_reward=round(raw_reward, 6),
             reward=reward,
             target_visible_gs=target_gs,
+            congestion=round(cong, 4),
+            congestion_penalty=congestion_penalty,
         )
         return obs, reward, terminated, truncated, info
 
@@ -571,30 +565,30 @@ class SatelliteEnv(gym.Env):
             f"──────────────────────────────────────┐"
         )
         col_hdr = (
-            "  │  Slot │ Sat   │ Dist km │  LRL s  │ IsConn │"
+            "  │  Slot │ Sat   │ Dist km │  LRL s  │ IsConn │ Cong  │"
         )
-        sep     = "  │───────┼───────┼─────────┼─────────┼────────│"
+        sep     = "  │───────┼───────┼─────────┼─────────┼────────┼───────│"
         rows = [header, col_hdr, sep]
 
         for k in range(N_NEIGHBORS):
             j = int(self._slot_j[k])
-            d, r, c = obs_2d[k]
+            d, r, c, cg = obs_2d[k]
             if j == -1:
-                rows.append("  │   {:d}   │  ---  │   ---   │   ---   │  ---   │".format(k))
+                rows.append("  │   {:d}   │  ---  │   ---   │   ---   │  ---   │ ---   │".format(k))
             else:
                 flag    = " ◄ active" if j == self._prev_nbr else ""
-                # r is √(lrl/LRL_HEALTH_HORIZON), so true LRL = r² × horizon
                 rows.append(
-                    "  │   {:d}   │ {:5s} │ {:7.1f} │ {:7.0f} │  {:3s}   │{}".format(
+                    "  │   {:d}   │ {:5s} │ {:7.1f} │ {:7.0f} │  {:3s}   │ {:4.2f}  │{}".format(
                         k,
                         f"s{j:02d}",
                         d * self.max_isl_km,
                         (r ** 2) * LRL_HEALTH_HORIZON,
                         "yes" if c > 0.5 else "no",
+                        max(cg, 0.0),
                         flag,
                     )
                 )
-        rows.append("  └──────────────────────────────────────────────────┘")
+        rows.append("  └───────────────────────────────────────────────────────────┘")
         output = "\n".join(rows)
         print(output)
         return output
