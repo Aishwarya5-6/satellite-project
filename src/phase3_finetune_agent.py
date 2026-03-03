@@ -120,9 +120,9 @@ class TeeLogger:
 
 def select_device() -> str:
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        print("  ✓ MPS detected — using CPU (faster for MlpPolicy, 24-dim obs)")
+        print("  ✓ MPS detected — using CPU (faster for MlpPolicy, 32-dim obs)")
     elif torch.cuda.is_available():
-        print("  ✓ CUDA detected — using CPU (faster for MlpPolicy, 24-dim obs)")
+        print("  ✓ CUDA detected — using CPU (faster for MlpPolicy, 32-dim obs)")
     else:
         print("  ✓ CPU selected")
     return "cpu"

@@ -62,10 +62,11 @@ def predict_greedy_action(obs: np.ndarray, info: dict) -> int:  # noqa: ARG001 �
     """
     Select the valid (non-padded) ISL neighbour with the shortest distance.
 
-    Obs layout per slot  (N_FEATURES = 3):
+    Obs layout per slot  (N_FEATURES = 4):
         [0] norm_dist    — normalised ISL distance   (lower = closer = better)
         [1] norm_lrl     — normalised residual link lifetime
         [2] is_connected — 1.0 if currently the active link
+        [3] congestion   — normalised node congestion level (ignored by heuristic)
 
     Padded slots: all features == −1.0.
 

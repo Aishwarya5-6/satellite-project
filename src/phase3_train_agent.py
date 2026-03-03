@@ -23,7 +23,7 @@ Audit Notes
 This is the PRIMARY training script.
 For the 500k fine-tune (ETA_S=2.0), see: phase3_finetune_agent.py
 
-SAFETY: model.learn() is COMMENTED OUT. Uncomment to retrain.
+model.learn() is ACTIVE. Training will begin immediately on execution.
 
 Usage
 ─────
@@ -59,14 +59,15 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 # ── Project Paths ─────────────────────────────────────────────────────────────
 PROJECT_ROOT  = Path(__file__).resolve().parent.parent
 TOPOLOGY_PATH = PROJECT_ROOT / "data" / "topology_dataset.npz"
-LOG_DIR       = PROJECT_ROOT / "logs" / "gold_run"
-MODEL_DIR     = PROJECT_ROOT / "models" / "gold_run"
+LOG_DIR       = PROJECT_ROOT / "logs" / "phase3.6_run"
+MODEL_DIR     = PROJECT_ROOT / "models" / "phase3.6_run"
 LOG_FILE      = LOG_DIR / "training_output.log"
 MD_LOG        = PROJECT_ROOT / "docs" / "TRAINING_LOG.md"
 VEC_NORM_PATH = MODEL_DIR / "vec_normalize.pkl"
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
+(MODEL_DIR / "checkpoints").mkdir(parents=True, exist_ok=True)
 (PROJECT_ROOT / "docs").mkdir(parents=True, exist_ok=True)
 
 # ── Ensure SatelliteEnv is importable ─────────────────────────────────────────
@@ -131,7 +132,7 @@ class TeeLogger:
 
 def validate_hardware() -> None:
     """Smoke-test CPU compute and print diagnostics."""
-    print("  🏆 GOLD RUN — device hardcoded to CPU (optimal for 24-dim MlpPolicy)")
+    print("  🏆 GOLD RUN — device hardcoded to CPU (optimal for 32-dim MlpPolicy)")
     print(f"    PyTorch        : {torch.__version__}")
     print(f"    Device         : {GOLD_DEVICE}")
     a = torch.randn(256, 256, device=GOLD_DEVICE)
@@ -315,7 +316,13 @@ class HardwareMonitorCallback(BaseCallback):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SaveVecNormalizeCallback(BaseCallback):
-    """Save VecNormalize statistics every ``save_freq`` steps."""
+    """Save VecNormalize statistics every ``save_freq`` steps.
+
+    Writes two files on each save:
+      • ``vec_normalize.pkl``                  — rolling latest (always current)
+      • ``checkpoints/vec_normalize_<N>.pkl``  — timestep-stamped copy that
+        matches the corresponding ``ppo_satellite_<N>_steps.zip`` checkpoint.
+    """
 
     def __init__(self, save_freq: int = 100_000, save_path: Path = VEC_NORM_PATH) -> None:
         super().__init__(verbose=0)
@@ -330,7 +337,14 @@ class SaveVecNormalizeCallback(BaseCallback):
         self._last_save_band = current_band
         vec_env = self.model.get_env()
         if isinstance(vec_env, VecNormalize):
+            # Rolling latest — always overwritten
             vec_env.save(str(self.save_path))
+            # Versioned copy — matches the checkpoint zip at this timestep
+            versioned = (
+                self.save_path.parent / "checkpoints"
+                / f"vec_normalize_{self.num_timesteps}_steps.pkl"
+            )
+            vec_env.save(str(versioned))
         return True
 
 
@@ -825,7 +839,7 @@ def train() -> None:
         model.learn(
             total_timesteps=GOLD_TOTAL_STEPS,
             callback=callbacks,
-            tb_log_name="ppo_satellite",
+            tb_log_name="ppo_phase3_6",
         )
         completed = True
     except KeyboardInterrupt:
@@ -844,7 +858,7 @@ def train() -> None:
         sys.stdout.flush()
 
     if completed:
-        final_path = MODEL_DIR / "ppo_train_final"
+        final_path = MODEL_DIR / "stability_ppo_m4"
         model.save(str(final_path))
         train_env.save(str(VEC_NORM_PATH))
         print(f"  ✓ Final model       → {final_path}.zip")
