@@ -99,7 +99,7 @@ def run_episode(env: VecNormalize, model: PPO) -> pd.DataFrame:
     done = False
     step = 0
 
-    print(f"  Running inference — sat_id: {underlying.current_sat}  seed: {EVAL_SEED}")
+    print(f"  Running inference — sat_id: {underlying._current_sat}  seed: {EVAL_SEED}")
     print(f"  {'Step':>8}  {'Sat':>4}  {'LRL':>7}  {'Delay ms':>9}  {'Reward':>9}  Event")
     print("  " + "─" * 58)
 
