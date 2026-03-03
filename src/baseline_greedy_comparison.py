@@ -59,7 +59,7 @@ def greedy_action(obs: np.ndarray) -> int:
     return best_slot
 
 # ── Run Greedy Episode ─────────────────────────────────────────────────────---
-def run_greedy_episode(env: SatelliteEnv) -> pd.DataFrame:
+def run_greedy_episode(env: SatelliteEnv) -> tuple[pd.DataFrame, int, int]:
     obs, info = env.reset(seed=EVAL_SEED)
     rows = []
     done = False
