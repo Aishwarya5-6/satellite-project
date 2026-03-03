@@ -1,0 +1,23 @@
+{
+  "handover_mean": 331.8,
+  "handover_std": 1.1661903789690602,
+  "latency_mean_ms": 5.649835339583334,
+  "latency_std_ms": 0.0070243097589284,
+  "gs_avail_mean": 16.80972222222222,
+  "gs_avail_std": 0.4974324293574014,
+  "return_mean": -11637.458373813537,
+  "return_std": 192.8867970820191,
+  "deaths_mean": 0.0,
+  "invalids_mean": 0.0,
+  "steps_per_ep": 86400,
+  "wall_s": 7.6386667499900796,
+  "dry_run": false,
+  "standardized": {
+    "system_survival_rate": 100.0,
+    "routing_stability_score": 99.62,
+    "avg_link_hold_s": 260.4,
+    "latency_optimality_index": 177.0,
+    "latency_cv_pct": 0.12,
+    "gs_contact_util": 16.81
+  }
+}
