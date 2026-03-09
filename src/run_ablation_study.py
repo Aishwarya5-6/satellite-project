@@ -1028,8 +1028,29 @@ def main() -> None:
     all_results: dict[str, dict] = {}
     wall_start = time.perf_counter()
 
-    for key in selected:
+    for i, key in enumerate(selected):
         cfg = ABLATIONS[key]
+
+        # ── Inter-ablation confirmation prompt ────────────────────────────────
+        # When running both ablations sequentially, pause between them so the
+        # user can review results, check system resources, or stop cleanly.
+        if i > 0:
+            _banner("READY FOR NEXT ABLATION", width=72)
+            print(f"  Ablation {selected[i-1]} has finished.")
+            print(f"  Next up : Ablation {cfg.name} — {cfg.label}")
+            print(f"  Patches : {cfg.patches}")
+            print()
+            try:
+                answer = input("  ▶  Press Enter to continue, or type 'skip' to skip, 'quit' to exit: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Interrupted — exiting cleanly.")
+                break
+            if answer == "quit":
+                print(f"  Exiting after Ablation {selected[i-1]}.")
+                break
+            if answer == "skip":
+                print(f"  Skipping Ablation {cfg.name}.")
+                continue
 
         _banner(f"ABLATION {cfg.name}: {cfg.label}", width=72)
         print(f"  Patches: {cfg.patches}\n")
@@ -1048,8 +1069,17 @@ def main() -> None:
         # Context manager has now restored original env globals.
         all_results[key] = results
 
+        # ── Per-ablation results summary ──────────────────────────────────────
+        _banner(f"ABLATION {cfg.name} COMPLETE", width=72)
+        std_d = all_results[key].get("standardized", {})
+        print(f"  System Survival Rate : {std_d.get('system_survival_rate_mean', '—')} ± {std_d.get('system_survival_rate_std', '—')} %")
+        print(f"  Routing Stability    : {std_d.get('routing_stability_score_mean', '—')} ± {std_d.get('routing_stability_score_std', '—')} %")
+        print(f"  Latency CV           : {std_d.get('latency_cv_pct_mean', '—')} ± {std_d.get('latency_cv_pct_std', '—')} %")
+        print(f"  Avg Link Hold        : {std_d.get('avg_link_hold_s_mean', '—')} ± {std_d.get('avg_link_hold_s_std', '—')} s")
+        print()
+
     # ── Aggregate comparison ──────────────────────────────────────────────────
-    if len(selected) > 1 or args.eval_only:
+    if len(all_results) > 1 or args.eval_only:
         print_comparison_table(all_results)
 
     # ── Write outputs ─────────────────────────────────────────────────────────
