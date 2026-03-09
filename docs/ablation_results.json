@@ -1,0 +1,42 @@
+{
+  "A": {
+    "handover_mean": 723.2,
+    "handover_std": 63.04728384316012,
+    "latency_mean_ms": 18.48709423263889,
+    "latency_std_ms": 0.7771067130466994,
+    "gs_avail_mean": 15.196296296296296,
+    "gs_avail_std": 0.917906125191418,
+    "return_mean": -47994.34128851413,
+    "return_std": 2924.8938587698376,
+    "deaths_mean": 0.0,
+    "invalids_mean": 0.0,
+    "standardized": {
+      "system_survival_rate": 100.0,
+      "routing_stability_score": 99.16,
+      "avg_link_hold_s": 119.5,
+      "latency_optimality_index": 54.1,
+      "latency_cv_pct": 4.2,
+      "gs_contact_util": 15.2
+    }
+  },
+  "B": {
+    "handover_mean": 740.4,
+    "handover_std": 61.516176734254216,
+    "latency_mean_ms": 18.590492687731484,
+    "latency_std_ms": 0.757350878411427,
+    "gs_avail_mean": 15.192824074074073,
+    "gs_avail_std": 0.9081362813405089,
+    "return_mean": -49195.57771273905,
+    "return_std": 2758.0551226784787,
+    "deaths_mean": 0.0,
+    "invalids_mean": 0.0,
+    "standardized": {
+      "system_survival_rate": 100.0,
+      "routing_stability_score": 99.14,
+      "avg_link_hold_s": 116.7,
+      "latency_optimality_index": 53.8,
+      "latency_cv_pct": 4.07,
+      "gs_contact_util": 15.19
+    }
+  }
+}

@@ -7,13 +7,15 @@ Greedy Lowest-Latency (Shortest-Path-First next-hop) deterministic baseline.
 Policy rule
 ───────────
   At every timestep the agent inspects the 8 neighbour slots in the raw
-  observation vector.  Each slot k exposes three features:
+  observation vector.  Each slot k exposes four features (N_FEATURES = 4):
 
-      obs[k*3 + 0]  =  norm_distance  ∈ [0, 1]   (dist_km / max_isl_km)
-      obs[k*3 + 1]  =  norm_lrl       ∈ [0, 1]   (health-bar — IGNORED)
-      obs[k*3 + 2]  =  is_connected   ∈ {0, 1}   (current link flag)
+      obs[k*4 + 0]  =  norm_distance  ∈ [0, 1]   (dist_km / max_isl_km)
+      obs[k*4 + 1]  =  norm_lrl       ∈ [0, 1]   (sqrt health-bar — IGNORED)
+      obs[k*4 + 2]  =  is_connected   ∈ {0, 1}   (current link flag)
+      obs[k*4 + 3]  =  congestion     ∈ [0, 1]   (node congestion — IGNORED)
 
-  Padded / inactive slots have all three features set to -1.0.
+  Observation shape: (32,) float32  (8 slots × 4 features).
+  Padded / inactive slots have all four features set to -1.0.
 
   Rule: select the slot index with the **minimum norm_distance** among
   all valid (non-padded) slots.  The policy completely ignores LRL,
@@ -102,14 +104,14 @@ def greedy_lowest_latency(obs: np.ndarray) -> int:
 
     Parameters
     ----------
-    obs : np.ndarray  shape (24,)  float32
+    obs : np.ndarray  shape (32,)  float32  (8 slots × 4 features)
 
     Returns
     -------
     action : int  ∈ {0, …, 7}
     """
-    # Extract norm_distance feature for all 8 slots: obs[0], obs[3], obs[6], …
-    distances = obs[0::N_FEATURES]   # shape (8,) — stride 3
+    # Extract norm_distance feature for all 8 slots: obs[0], obs[4], obs[8], …
+    distances = obs[0::N_FEATURES]   # shape (8,) — stride N_FEATURES (= 4)
 
     # Valid slots have norm_distance ≥ 0.  Padded slots have distance = -1.0.
     valid_mask = distances >= 0.0
