@@ -504,9 +504,11 @@ class SatelliteEnv(gym.Env):
         if cong > 0.8:
             congestion_penalty = -2.0
 
-        # Inflate latency to simulate queuing delay: 1× at cong=0, 3× at cong=1
-        queuing_multiplier = 1.0 + 2.0 * cong
-        latency_ms *= queuing_multiplier
+        # M/M/1 queuing delay: 10 ms base scaling, diverges as cong → 1.0
+        # At cong=0.0: +0.0 ms  | cong=0.5: +9.9 ms  | cong=0.8: +38 ms  | cong=0.99: +495 ms
+        raw_prop_delay_ms    = latency_ms
+        queuing_delay_ms     = 10.0 * (cong / (1.01 - cong))
+        effective_latency_ms = raw_prop_delay_ms + queuing_delay_ms
 
         raw_reward += congestion_penalty
         reward = float(np.clip(raw_reward, REWARD_MIN, REWARD_MAX))
@@ -537,7 +539,10 @@ class SatelliteEnv(gym.Env):
             slot_chosen=action,
             dist_km=round(dist_val, 3),
             lrl_s=lrl_val,
-            latency_ms=round(latency_ms, 4),
+            latency_ms=round(effective_latency_ms, 4),          # ← effective latency (backward-compat key)
+            raw_prop_delay_ms=round(raw_prop_delay_ms, 4),        # ← pure propagation delay
+            queuing_delay_ms=round(queuing_delay_ms, 4),          # ← M/M/1 queuing component
+            effective_latency_ms=round(effective_latency_ms, 4),  # ← explicit effective key
             norm_latency=round(norm_latency, 6),
             I_switch=int(I_switch),
             raw_reward=round(raw_reward, 6),

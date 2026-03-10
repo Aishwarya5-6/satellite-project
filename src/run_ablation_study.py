@@ -570,7 +570,7 @@ def evaluate_ablation(
                 invalids += 1
             else:
                 handovers += int(info.get("I_switch", 0))
-                lat = float(info.get("latency_ms", 0.0))
+                lat = float(info.get("effective_latency_ms", info.get("latency_ms", 0.0)))
                 if lat > 0.0:
                     latencies.append(lat)
 
@@ -870,7 +870,7 @@ def write_ablation_report(all_results: dict[str, dict]) -> None:
         return f"{float(v):.{dec}f}" if v is not None else "—"
 
     supp_rows: list[tuple[str, str, int]] = [
-        ("Mean Propagation Delay (ms)", "latency_mean_ms", 3),
+        ("Mean Effective Latency (ms)", "latency_mean_ms", 3),
         ("LRL Deaths / Episode ↓",      "deaths_mean",     1),
         ("Invalid Actions / Episode",   "invalids_mean",   1),
         ("GS Contact Utilisation (%)",  "gs_contact_util", 2),

@@ -248,7 +248,7 @@ def evaluate(model: PPO, n_episodes: int = 5) -> dict:
                 invalids += 1
             else:
                 handovers += int(info.get("I_switch", 0))
-                lat = float(info.get("latency_ms", 0.0))
+                lat = float(info.get("effective_latency_ms", info.get("latency_ms", 0.0)))
                 if lat > 0.0:
                     latencies.append(lat)
 
@@ -302,7 +302,7 @@ def evaluate(model: PPO, n_episodes: int = 5) -> dict:
     print("=" * W)
     print(f"  {'Handover Jitter (switches/ep)':<40s} "
           f"{results['handover_mean']:10.1f} ± {results['handover_std']:.1f}")
-    print(f"  {'Mean Propagation Delay [ms]':<40s} "
+    print(f"  {'Mean Effective Latency [ms]':<40s} "
           f"{results['latency_mean_ms']:10.4f} ± {results['latency_std_ms']:.4f}")
     print(f"  {'GS Network Availability [%]':<40s} "
           f"{results['gs_avail_mean']:10.2f} ± {results['gs_avail_std']:.2f}")

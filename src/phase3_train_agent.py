@@ -473,7 +473,7 @@ class MarkdownTrackerCallback(BaseCallback):
                 f"## 📊 Final Evaluation — {self.n_eval_episodes} × 86,400-step Episodes",
                 "", "| Metric | Value |", "|---|---|",
                 f"| Handover Jitter (switches/ep) | {r['handover_mean']:.1f} ± {r['handover_std']:.1f} |",
-                f"| Mean Propagation Delay (ms) | {r['latency_mean_ms']:.4f} ± {r['latency_std_ms']:.4f} |",
+                f"| Mean Effective Latency (ms) | {r['latency_mean_ms']:.4f} ± {r['latency_std_ms']:.4f} |",
                 f"| GS Network Availability (%) | {r['gs_avail_mean']:.2f} ± {r['gs_avail_std']:.2f} |",
                 f"| Mean Episode Return | {r['return_mean']:.2f} ± {r['return_std']:.2f} |",
                 f"| LRL Death Events / ep | {r['deaths_mean']:.1f} |",
@@ -562,7 +562,7 @@ def evaluate(model: PPO, vec_norm_path: Path = VEC_NORM_PATH, n_episodes: int = 
                 invalids += 1
             else:
                 handovers += int(info.get("I_switch", 0))
-                lat = float(info.get("latency_ms", 0.0))
+                lat = float(info.get("effective_latency_ms", info.get("latency_ms", 0.0)))
                 if lat > 0.0:
                     latencies.append(lat)
 
@@ -616,7 +616,7 @@ def evaluate(model: PPO, vec_norm_path: Path = VEC_NORM_PATH, n_episodes: int = 
     print("=" * W)
     print(f"  {'Handover Jitter (switches/ep)':<40s} "
           f"{results['handover_mean']:10.1f} ± {results['handover_std']:.1f}")
-    print(f"  {'Mean Propagation Delay [ms]':<40s} "
+    print(f"  {'Mean Effective Latency [ms]':<40s} "
           f"{results['latency_mean_ms']:10.4f} ± {results['latency_std_ms']:.4f}")
     print(f"  {'GS Network Availability [%]':<40s} "
           f"{results['gs_avail_mean']:10.2f} ± {results['gs_avail_std']:.2f}")
