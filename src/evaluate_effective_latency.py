@@ -63,7 +63,7 @@ ABL_B_VEC_NORM    = PROJECT_ROOT / "models" / "ablations" / "ablation_B" / "vec_
 OUTPUT_JSON = DOCS_DIR / "effective_latency_comparison.json"
 
 # ── Evaluation settings ───────────────────────────────────────────────────────
-N_EVAL_EPISODES = 20
+N_EVAL_EPISODES = 100
 SEED_BASE       = 2000      # episodes use seeds SEED_BASE … SEED_BASE + N_EVAL_EPISODES - 1
 
 # ── Composite metric constants ────────────────────────────────────────────────
@@ -398,6 +398,13 @@ def aggregate(results: list[EpisodeResult]) -> dict:
         "latency_cv_pct":             round(lat_cv, 2),
         "latency_cv_mean":            float(np.mean(ep_cvs)),
         "latency_cv_std":             float(np.std(ep_cvs)),
+        # 95 % confidence interval for mean effective latency (t-dist, df = n - 1)
+        "eff_latency_ci95_ms":        round(
+            float(_scipy_stats.t.ppf(0.975, df=max(len(results) - 1, 1)))
+            * float(np.std(ep_eff_lats, ddof=1))
+            / float(np.sqrt(len(results))),
+            4,
+        ),
         "ssr_mean":                   float(np.mean(ssr_per_ep)),
         "routing_stability_score":    round(rss, 2),
         "avg_link_hold_s":            round(ald, 1),
@@ -486,6 +493,9 @@ def print_comparison_table(
         lambda r: f"{r['handover_mean']:.1f} ± {r['handover_std']:.1f}")
     row("Mean Effective Latency (ms)",
         lambda r: f"{r['eff_latency_mean_ms']:.3f} ± {r['eff_latency_std_ms']:.3f}")
+    row("  95% CI (ms)",
+        lambda r: f"[{r['eff_latency_mean_ms'] - r.get('eff_latency_ci95_ms', 0):.3f}, "
+                  f"{r['eff_latency_mean_ms'] + r.get('eff_latency_ci95_ms', 0):.3f}]")
     row("  ↳ Propagation component (ms)",
         lambda r: f"{r['raw_latency_mean_ms']:.3f}")
     row("  ↳ Queuing component (ms)",
@@ -546,7 +556,7 @@ def print_comparison_table(
     # ── Statistical significance vs Full PPO ─────────────────────────────────
     if stats_vs_ppo:
         print("  Statistical Significance  vs  Full PPO (Gold)")
-        print("  Welch's independent t-test on per-episode effective latency (N=20 each)")
+        print(f"  Welch's independent t-test on per-episode effective latency (N={N_EVAL_EPISODES} each)")
         print("  " + "─" * 70)
         for lbl, s in stats_vs_ppo.items():
             sig_str  = "p < 0.05 → SIGNIFICANT" if s["significant"] else "p ≥ 0.05 → NOT significant"
