@@ -74,11 +74,11 @@ except ImportError:
 
 TOPOLOGY_PATH = PROJECT_ROOT / "data"   / "topology_dataset.npz"
 LOG_DIR       = PROJECT_ROOT / "logs"
-MODEL_DIR     = PROJECT_ROOT / "models"
+MODEL_DIR     = PROJECT_ROOT / "models" / "phase3.6_run"
 CKPT_DIR      = MODEL_DIR   / "checkpoints"
 FIGURES_DIR   = PROJECT_ROOT / "paper_figures"
 
-EVAL_NPZ    = LOG_DIR  / "evaluations.npz"
+EVAL_NPZ    = LOG_DIR  / "phase3.6_run" / "evaluations.npz"
 BEST_MODEL  = MODEL_DIR / "best_model.zip"
 FINAL_MODEL = MODEL_DIR / "stability_ppo_m4.zip"
 
@@ -645,6 +645,229 @@ def fig5_gs_availability(model: PPO, env: SatelliteEnv) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Fig 6 · System Pipeline Diagram
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def fig6_pipeline_diagram() -> None:
+    """
+    Horizontal four-stage pipeline:
+      Phase 1 (Topology) → Phase 2 (MDP/Env) → Phase 3 (PPO Training) → Evaluation
+    Each stage is a rounded box with key bullet-points inside.
+    """
+    print("\n[Fig 6] System pipeline diagram …")
+
+    fig, ax = plt.subplots(figsize=(7.16, 2.6))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 3.2)
+    ax.axis("off")
+
+    stages = [
+        {
+            "x": 0.25,
+            "label": "Phase 1\nTopology\nGeneration",
+            "color": "#d0e8ff",
+            "edge":  "#1a6faf",
+            "lines": ["Walker Delta 60/5/1", "550 km · 53°", "J2-perturbed ECI", "ISL LRL computation", "→ topology_dataset.npz"],
+        },
+        {
+            "x": 2.80,
+            "label": "Phase 2\nGym\nEnvironment",
+            "color": "#d8f0d8",
+            "edge":  "#2a7a2a",
+            "lines": ["MDP formulation", "Obs: Box(32,)  Act: Disc(8)", "Congestion random walk", "LRL health-bar obs", "M/M/1 queuing model"],
+        },
+        {
+            "x": 5.35,
+            "label": "Phase 3\nPPO\nTraining",
+            "color": "#fff0cc",
+            "edge":  "#b87d00",
+            "lines": ["SB3 PPO · 3 M steps", "MlpPolicy 256×256", "EvalCallback (50k)", "CheckpointCallback", "→ best_model.zip"],
+        },
+        {
+            "x": 7.90,
+            "label": "Evaluation\n& Ablation",
+            "color": "#fde0e0",
+            "edge":  "#a02020",
+            "lines": ["N=20 episodes", "Greedy baseline", "Ablation A / B", "Statistical tests", "→ paper figures"],
+        },
+    ]
+
+    box_w = 2.10
+    box_h = 2.70
+    box_y = 0.25
+
+    for s in stages:
+        fc  = s["color"]
+        ec  = s["edge"]
+        xb  = s["x"]
+        # Box
+        rect = matplotlib.patches.FancyBboxPatch(
+            (xb, box_y), box_w, box_h,
+            boxstyle="round,pad=0.06",
+            facecolor=fc, edgecolor=ec, linewidth=1.2, zorder=2,
+        )
+        ax.add_patch(rect)
+        # Stage header
+        ax.text(xb + box_w / 2, box_y + box_h - 0.22,
+                s["label"], ha="center", va="top",
+                fontsize=7.8, fontweight="bold", color=ec, zorder=3,
+                linespacing=1.3)
+        # Bullet lines
+        for i, line in enumerate(s["lines"]):
+            ax.text(xb + 0.13, box_y + box_h - 0.82 - i * 0.37,
+                    f"• {line}", ha="left", va="top",
+                    fontsize=6.2, color="#222222", zorder=3)
+
+    # Arrows between stages
+    arrow_kw = dict(
+        arrowstyle="-|>",
+        color="#555555",
+        lw=1.4,
+        mutation_scale=10,
+    )
+    for i in range(len(stages) - 1):
+        x_tail = stages[i]["x"] + box_w + 0.03
+        x_head = stages[i + 1]["x"] - 0.03
+        y_mid  = box_y + box_h / 2
+        ax.annotate(
+            "", xy=(x_head, y_mid), xytext=(x_tail, y_mid),
+            arrowprops=arrow_kw, zorder=4,
+        )
+
+    ax.set_title(
+        "Fig. 6: Research Pipeline — Phase 1 → Phase 2 → Phase 3 → Evaluation",
+        fontsize=9, fontweight="bold", pad=6,
+    )
+    fig.tight_layout(pad=0.4)
+    _save(fig, "fig6_pipeline_diagram")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Fig 7 · Reward Component Diagram
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def fig7_reward_diagram() -> None:
+    """
+    Visual decomposition of the 5-component reward function.
+    Left column: component name + formula.
+    Right column: value / trigger.
+    Center: combined reward expression.
+    """
+    print("\n[Fig 7] Reward component diagram …")
+
+    fig, ax = plt.subplots(figsize=(7.16, 3.5))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 5.2)
+    ax.axis("off")
+
+    # ── Title ─────────────────────────────────────────────────────────────────
+    ax.text(5.0, 5.05,
+            "Fig. 7: Reward Function Decomposition — 5-Component Architecture",
+            ha="center", va="top", fontsize=9, fontweight="bold")
+
+    # ── Central reward formula box ────────────────────────────────────────────
+    formula_box = matplotlib.patches.FancyBboxPatch(
+        (2.7, 1.85), 4.6, 1.10,
+        boxstyle="round,pad=0.08",
+        facecolor="#f5f5f5", edgecolor="#333333", linewidth=1.2, zorder=2,
+    )
+    ax.add_patch(formula_box)
+    ax.text(5.0, 2.42,
+            r"$R_t = \mathrm{clip}(-W_1\hat{d}_{ij} - W_2\eta_s\mathbf{1}_\mathrm{switch}"
+            r" + B_\mathrm{GS} + P_\mathrm{cong} + P_\mathrm{LRL},\;-500,\;+1)$",
+            ha="center", va="center", fontsize=8, color="#111111", zorder=3)
+    ax.text(5.0, 2.00,
+            "Override: LRL death → −500  |  Invalid action → −10",
+            ha="center", va="center", fontsize=7, color="#555555",
+            style="italic", zorder=3)
+
+    # ── Component rows ────────────────────────────────────────────────────────
+    components = [
+        {
+            "label":   r"$-W_1 \hat{d}_{ij}$  (Propagation penalty)",
+            "detail":  r"$W_1 = 0.5$,   $\hat{d} = d_{ij}/d_\mathrm{ISL} \in [0,1]$",
+            "value":   "≈ −0.25 … 0",
+            "color":   "#d0e8ff",
+            "edge":    "#1a6faf",
+            "obj":     "Minimise propagation delay",
+        },
+        {
+            "label":   r"$-W_2\eta_s\mathbf{1}_\mathrm{switch}$  (Handover penalty)",
+            "detail":  r"$W_2 = 1.0$,   $\eta_s = 1.0$ s  (PAT setup cost)",
+            "value":   "−1.0  or  0",
+            "color":   "#fff0cc",
+            "edge":    "#b87d00",
+            "obj":     "Minimise link thrashing",
+        },
+        {
+            "label":   r"$B_\mathrm{GS}$  (Ground-station bonus)",
+            "detail":  "+0.5 if selected satellite has ≥1 GS visible",
+            "value":   "+0.5  or  0",
+            "color":   "#d8f0d8",
+            "edge":    "#2a7a2a",
+            "obj":     "Maximise GS coverage",
+        },
+        {
+            "label":   r"$P_\mathrm{cong}$  (Congestion penalty)",
+            "detail":  r"$-2.0$ if $c_j > 0.8$  (M/M/1 saturation zone)",
+            "value":   "−2.0  or  0",
+            "color":   "#fde0e0",
+            "edge":    "#a02020",
+            "obj":     "Avoid overloaded nodes",
+        },
+        {
+            "label":   r"$P_\mathrm{LRL}$  (Survival penalty)",
+            "detail":  r"$-500$ if active link LRL expires  ($\ell_{ij} = 0$)",
+            "value":   "−500  or  0",
+            "color":   "#ead8f5",
+            "edge":    "#6a1fa0",
+            "obj":     "Hard survival constraint",
+        },
+    ]
+
+    row_h   = 0.52
+    y_start = 4.62
+    x_lbl   = 0.08
+    x_val   = 7.82
+    x_obj   = 8.55
+
+    for i, c in enumerate(components):
+        y = y_start - i * row_h
+        # Coloured label patch
+        patch = matplotlib.patches.FancyBboxPatch(
+            (x_lbl, y - 0.38), 7.55, 0.44,
+            boxstyle="round,pad=0.04",
+            facecolor=c["color"], edgecolor=c["edge"],
+            linewidth=0.7, zorder=2,
+        )
+        ax.add_patch(patch)
+        # Component formula + detail
+        ax.text(x_lbl + 0.12, y - 0.12,
+                c["label"], ha="left", va="center",
+                fontsize=7.4, fontweight="bold", color=c["edge"], zorder=3)
+        ax.text(x_lbl + 0.12, y - 0.30,
+                c["detail"], ha="left", va="center",
+                fontsize=6.4, color="#333333", zorder=3)
+        # Value badge
+        ax.text(x_val, y - 0.20,
+                c["value"], ha="right", va="center",
+                fontsize=6.8, fontweight="bold", color=c["edge"], zorder=3)
+
+    # Arrows from component rows into centre box
+    for i in range(len(components)):
+        y_row = y_start - i * row_h - 0.17
+        if y_row > 2.95:
+            # Arrow from right of label box → top of formula box
+            ax.annotate("", xy=(5.0, 2.95), xytext=(5.0, y_row),
+                        arrowprops=dict(arrowstyle="-|>", color="#aaaaaa",
+                                        lw=0.6, mutation_scale=7),
+                        zorder=1)
+
+    fig.tight_layout(pad=0.4)
+    _save(fig, "fig7_reward_diagram")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Entry Point
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -676,6 +899,10 @@ def main() -> None:
         fig5_gs_availability(model, env)
     finally:
         env.close()
+
+    # ── Static diagrams (no env / model needed) ───────────────────────────────
+    fig6_pipeline_diagram()
+    fig7_reward_diagram()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     pdfs = sorted(FIGURES_DIR.glob("*.pdf"))
