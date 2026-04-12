@@ -758,7 +758,7 @@ def print_comparison_table(all_results: dict[str, dict]) -> None:
         ref_val = REF.get(ref_key_plain)
         if ref_val is not None:
             fmt = f"{{:.{dec}f}}"
-            row += f"  {'★ ' + fmt.format(float(ref_val)):^{col_w}}"
+            row += f"  {'★ ' + fmt.format(float(ref_val)):^{col_w}}"  # type: ignore[arg-type]
         else:
             row += f"  {'—':^{col_w}}"
 
@@ -795,7 +795,7 @@ def write_ablation_report(all_results: dict[str, dict]) -> None:
         if v is None:
             return "—"
         fmt = f"{{:.{dec}f}}"
-        return fmt.format(float(v))
+        return fmt.format(float(v))  # type: ignore[arg-type]
 
     lines = [
         "# Ablation Study Report",
@@ -867,7 +867,7 @@ def write_ablation_report(all_results: dict[str, dict]) -> None:
         if v is None:
             std_d = results.get("standardized", {})
             v = std_d.get(key) if isinstance(std_d, dict) else None
-        return f"{float(v):.{dec}f}" if v is not None else "—"
+        return f"{float(v):.{dec}f}" if v is not None else "—"  # type: ignore[arg-type]
 
     supp_rows: list[tuple[str, str, int]] = [
         ("Mean Effective Latency (ms)", "latency_mean_ms", 3),

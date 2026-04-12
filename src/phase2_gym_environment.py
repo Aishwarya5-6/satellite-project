@@ -159,6 +159,12 @@ class SatelliteEnv(gym.Env):
         """
         Load topology_dataset.npz and build dense NumPy arrays.
 
+        On the first call the NPZ is decompressed and the raw arrays are
+        written to an uncompressed ``.npy`` cache directory alongside the
+        dataset file.  Every subsequent call (including from SubprocVecEnv
+        worker processes) loads the cache directly, reducing per-worker
+        startup from ~14 min to ~1 s on an M4 SSD.
+
         Arrays
         ──────
         dist_km   : (T, N, N)  float32  pairwise distance in km; 0 = no link
@@ -167,41 +173,70 @@ class SatelliteEnv(gym.Env):
         timestamps: (T,)       int32    epoch second for each timestep index
         gsl_masks : dict[str, (T, N) bool]  per ground station visibility
         """
+        import json as _json
+
         if not self._topology_path.exists():
             raise FileNotFoundError(
                 f"Dataset not found: {self._topology_path}\n"
                 f"Run src/phase1_environment_modeling.py first to generate it."
             )
 
-        print(f"  [Phase 2] Loading topology: {self._topology_path.name} …",
-              end=" ", flush=True)
+        # ── Cache paths ───────────────────────────────────────────────────────
+        cache_dir  = self._topology_path.parent / ".topology_cache"
+        tag        = self._topology_path.stem          # e.g. "topology_dataset"
+        _dist_p    = cache_dir / f"{tag}_dist_km.npy"
+        _lrl_p     = cache_dir / f"{tag}_lrl_s.npy"
+        _ts_p      = cache_dir / f"{tag}_timestamps.npy"
+        _meta_p    = cache_dir / f"{tag}_meta.json"
+        _cache_ok  = _dist_p.exists() and _lrl_p.exists() and _ts_p.exists() and _meta_p.exists()
 
-        data = np.load(self._topology_path, allow_pickle=False)
-
-        self.timestamps = data["timestamps"]                         # (T,) int32
-        self.T          = int(self.timestamps.shape[0])
-
-        # isl_distances is stored as float16 (km) — cast to float32 immediately
-        # so all reward arithmetic is done in full precision.
-        self.dist_km   = data["isl_distances"].astype(np.float32)   # (T, N, N) km
-        self.lrl_s     = data["isl_lifetimes"].astype(np.float32)   # (T, N, N) s
-        # Use lrl_s > 0 (not dist_km > 0) as the canonical connectivity mask.
-        # This is robust against Phase 1 datasets that store distances for all
-        # pairs: a link is active iff its residual lifetime is positive.
-        self.connected = self.lrl_s > 0                             # (T, N, N) bool
-
-        # Ground station visibility masks: {city_name: (T, N) bool}
-        self.gsl_masks: dict[str, np.ndarray] = {}
-        for key in data.files:
-            if key.startswith("gsl_"):
-                city = key[4:]                   # strip "gsl_" prefix
-                self.gsl_masks[city] = data[key] # (T, N) bool
-
-        # Dynamic ISL threshold (written by Phase 1; fallback for legacy npz)
-        if "isl_threshold_km" in data.files:
-            self.max_isl_km = float(data["isl_threshold_km"])
+        if _cache_ok:
+            # ── Fast path: load uncompressed cache (~1 s on M4 SSD) ──────────
+            print(f"  [Phase 2] Loading topology from cache …", end=" ", flush=True)
+            _meta           = _json.loads(_meta_p.read_text())
+            self.timestamps = np.load(_ts_p)
+            self.T          = int(self.timestamps.shape[0])
+            self.dist_km    = np.load(_dist_p)
+            self.lrl_s      = np.load(_lrl_p)
+            self.connected  = self.lrl_s > 0
+            self.max_isl_km = float(_meta["isl_threshold_km"])
+            self.gsl_masks  = {}
+            for _gf in sorted(cache_dir.glob(f"{tag}_gsl_*.npy")):
+                _city = _gf.stem[len(f"{tag}_gsl_"):]
+                self.gsl_masks[_city] = np.load(_gf)
         else:
-            self.max_isl_km = 5_000.0            # safe legacy default [km]
+            # ── Slow path: decompress NPZ and write cache ─────────────────────
+            print(f"  [Phase 2] Loading topology: {self._topology_path.name} …",
+                  end=" ", flush=True)
+
+            data = np.load(self._topology_path, allow_pickle=False)
+
+            self.timestamps = data["timestamps"]                         # (T,) int32
+            self.T          = int(self.timestamps.shape[0])
+            self.dist_km    = data["isl_distances"].astype(np.float32)  # (T, N, N) km
+            self.lrl_s      = data["isl_lifetimes"].astype(np.float32)  # (T, N, N) s
+            self.connected  = self.lrl_s > 0                            # (T, N, N) bool
+
+            self.gsl_masks: dict[str, np.ndarray] = {}
+            for key in data.files:
+                if key.startswith("gsl_"):
+                    self.gsl_masks[key[4:]] = data[key]  # (T, N) bool
+
+            if "isl_threshold_km" in data.files:
+                self.max_isl_km = float(data["isl_threshold_km"])
+            else:
+                self.max_isl_km = 5_000.0
+
+            # Write cache so all future loads (including SubprocVecEnv workers
+            # in this and subsequent seeds) use the fast path.
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            np.save(_dist_p, self.dist_km)
+            np.save(_lrl_p,  self.lrl_s)
+            np.save(_ts_p,   self.timestamps)
+            _meta_p.write_text(_json.dumps({"isl_threshold_km": self.max_isl_km}))
+            for _city, _mask in self.gsl_masks.items():
+                np.save(cache_dir / f"{tag}_gsl_{_city}.npy", _mask)
+            print(f"\n  [Phase 2] Cache written → {cache_dir}", end=" ", flush=True)
 
         print(f"done.  T={self.T} steps, N={N_SATS} sats, "
               f"{len(self.gsl_masks)} ground stations, "

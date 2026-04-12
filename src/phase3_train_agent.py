@@ -34,7 +34,9 @@ Usage
 from __future__ import annotations
 
 import atexit
+import gc
 import json
+import os
 import subprocess
 import sys
 import time
@@ -97,6 +99,8 @@ GOLD_TARGET_KL      = 0.02
 GOLD_MAX_GRAD_NORM  = 0.5
 GOLD_SEED           = 42
 GOLD_COLLAPSE_ARM   = 200_000
+# Seeds used for the multi-seed training loop (one independent run per seed).
+TRAINING_SEEDS: list[int] = [42, 101, 202, 303, 404]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -365,6 +369,7 @@ class MarkdownTrackerCallback(BaseCallback):
         hyperparams: dict | None = None,
         eval_cb: EvalCallback | None = None,
         n_eval_episodes: int = 5,
+        log_path: Path = MD_LOG,
     ) -> None:
         super().__init__(verbose=0)
         self.update_freq       = update_freq
@@ -372,6 +377,7 @@ class MarkdownTrackerCallback(BaseCallback):
         self.hyperparams       = hyperparams or {}
         self.eval_cb           = eval_cb
         self.n_eval_episodes   = n_eval_episodes
+        self._log_path         = log_path
         self._t0               = time.perf_counter()
         self._rows: list[dict] = []
         self._best_reward      = float("-inf")
@@ -493,15 +499,22 @@ class MarkdownTrackerCallback(BaseCallback):
                     f"| GS Contact Utilisation | {s['gs_contact_util']:.2f}% | Geometry-Limited |",
                     "",
                 ]
-        MD_LOG.write_text("\n".join(lines), encoding="utf-8")
+        self._log_path.write_text("\n".join(lines), encoding="utf-8")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # §10  Post-Training Evaluation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def evaluate(model: PPO, vec_norm_path: Path = VEC_NORM_PATH, n_episodes: int = 5) -> dict:
+def evaluate(
+    model: PPO,
+    vec_norm_path: Path = VEC_NORM_PATH,
+    n_episodes: int = 5,
+    traj_path: Path | None = None,
+) -> dict:
     """Run n_episodes full 24-h orbit evaluations with saved VecNormalize stats."""
+    if traj_path is None:
+        traj_path = PROJECT_ROOT / "docs" / "eval_trajectories.json"
     print("─" * 72)
     print(f"  Post-Training Evaluation — {n_episodes} × 86,400-step episodes")
     print("─" * 72)
@@ -629,7 +642,6 @@ def evaluate(model: PPO, vec_norm_path: Path = VEC_NORM_PATH, n_episodes: int = 
     print("=" * W)
     print()
 
-    traj_path = PROJECT_ROOT / "docs" / "eval_trajectories.json"
     with open(traj_path, "w", encoding="utf-8") as f:
         json.dump(all_trajectories, f, indent=2)
     print(f"  🗺️  Trajectory log saved → {traj_path}")
@@ -694,41 +706,56 @@ def compute_standardized_metrics(raw: dict) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# §11  Main Training Pipeline
+# §11  Main Training Pipeline (Multi-Seed)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def train() -> None:
-    """GOLD RUN training pipeline — audited and locked."""
+def _train_single_seed(seed: int) -> None:
+    """
+    Train one PPO agent for GOLD_TOTAL_STEPS with the given random seed.
 
-    _caff = subprocess.Popen(
-        ["caffeinate", "-di"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    atexit.register(lambda: _caff.poll() is None and _caff.terminate())
-    print(f"  ☕ caffeinate started (PID {_caff.pid})")
+    All outputs are written to seed-specific subdirectories so that multiple
+    runs never overwrite each other:
+      models/phase3.6_run/seed_<seed>/
+        best_model.zip          ← EvalCallback best checkpoint
+        final_model.zip         ← weights at end of training
+        stability_ppo_seed<seed>.zip
+        vec_normalize.pkl
+        TRAINING_LOG.md
+        eval_trajectories.json
+        checkpoints/
+      logs/phase3.6_run/seed_<seed>/
+        ppo_seed<seed>_*/       ← TensorBoard event files
 
-    tee = TeeLogger(LOG_FILE)
-    sys.stdout = tee   # type: ignore[assignment]
-    sys.stderr = tee   # type: ignore[assignment]
+    After training completes (or fails), all environment references are
+    explicitly closed and deleted, then gc.collect() is called to release
+    memory before the next seed iteration begins.
+    """
+    from stable_baselines3.common.vec_env import DummyVecEnv
 
-    DIVIDER = "=" * 72
-    print(DIVIDER)
-    print("  Phase 3 — PPO Agent Training  (3M Steps · Gold Run)")
-    print(f"  Script    : phase3_train_agent.py")
-    print(f"  Started   : {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  Dataset   : {TOPOLOGY_PATH.name}")
-    print(f"  ETA_S     : {GOLD_ETA_S} (baseline)")
-    print(f"  Device    : {GOLD_DEVICE} (hardcoded)")
-    print(f"  n_envs    : {GOLD_N_ENVS} (SubprocVecEnv → ~1448 FPS)")
-    print(f"  Next step : phase3_finetune_agent.py (ETA_S=2.0, 500k steps)")
-    print(DIVIDER)
+    seed_model_dir = MODEL_DIR / f"seed_{seed}"
+    seed_log_dir   = LOG_DIR   / f"seed_{seed}"
+    seed_model_dir.mkdir(parents=True, exist_ok=True)
+    (seed_model_dir / "checkpoints").mkdir(exist_ok=True)
+    seed_log_dir.mkdir(parents=True, exist_ok=True)
 
-    validate_hardware()
-    _patch_eta_s()
+    vec_norm_path = seed_model_dir / "vec_normalize.pkl"
+    md_log_path   = seed_model_dir / "TRAINING_LOG.md"
+    traj_path     = seed_model_dir / "eval_trajectories.json"
 
-    print(f"\n  Building SubprocVecEnv (n_envs={GOLD_N_ENVS}, sat=-1) …")
-    raw_vec   = make_vec_env(n_envs=GOLD_N_ENVS, sat_id=-1, base_seed=GOLD_SEED)
+    print(f"\n  Model dir  : {seed_model_dir}")
+    print(f"  Log dir    : {seed_log_dir}")
+    print(f"  VecNorm    : {vec_norm_path}")
+    print(f"  MD log     : {md_log_path}")
+    print()
+
+    # ── Set global random seeds ───────────────────────────────────────────────
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    print(f"  ✓ Global seeds set: numpy={seed}, torch={seed}")
+
+    # ── Build training VecEnv ─────────────────────────────────────────────────
+    print(f"  Building SubprocVecEnv (n_envs={GOLD_N_ENVS}, sat=-1, base_seed={seed}) …")
+    raw_vec   = make_vec_env(n_envs=GOLD_N_ENVS, sat_id=-1, base_seed=seed)
     train_env = VecNormalize(
         raw_vec,
         norm_obs=True, norm_reward=True,
@@ -737,10 +764,12 @@ def train() -> None:
     )
     print("  ✓ VecNormalize(norm_obs=True, norm_reward=True, clip=10.0)")
 
+    # ── Build evaluation env ──────────────────────────────────────────────────
+    # Eval seed is offset from the training seed to avoid overlap while still
+    # being deterministic and reproducible per seed.
     print("  Building evaluation env …")
-    eval_raw = make_eval_env(sat_id=-1, seed=99)
-    from stable_baselines3.common.vec_env import DummyVecEnv
-    eval_dummy = DummyVecEnv([lambda: eval_raw])
+    eval_raw   = make_eval_env(sat_id=-1, seed=seed + 9_999)
+    eval_dummy = DummyVecEnv([lambda: eval_raw])  # noqa: B023
     eval_env   = VecNormalize(
         eval_dummy,
         norm_obs=True, norm_reward=False,
@@ -764,7 +793,7 @@ def train() -> None:
         "device":          GOLD_DEVICE,
         "eta_s":           f"{GOLD_ETA_S} (baseline)",
         "vec_normalize":   "obs=True, reward=True, clip=10.0",
-        "seed":            GOLD_SEED,
+        "seed":            seed,
     }
     print("  Hyperparameters")
     print("  ┌──────────────────────────────────────────────────────┐")
@@ -773,6 +802,7 @@ def train() -> None:
     print("  └──────────────────────────────────────────────────────┘")
     print()
 
+    # ── Initialise a fresh PPO agent ──────────────────────────────────────────
     model = PPO(
         policy="MlpPolicy",
         env=train_env,
@@ -787,14 +817,14 @@ def train() -> None:
         max_grad_norm=GOLD_MAX_GRAD_NORM,
         verbose=1,
         device=GOLD_DEVICE,
-        tensorboard_log=str(LOG_DIR),
-        seed=GOLD_SEED,
+        tensorboard_log=str(seed_log_dir),
+        seed=seed,
     )
 
     eval_callback = EvalCallback(
         eval_env,
-        best_model_save_path=str(MODEL_DIR),
-        log_path=str(LOG_DIR),
+        best_model_save_path=str(seed_model_dir),
+        log_path=str(seed_log_dir),
         eval_freq=50_000 // GOLD_N_ENVS,
         n_eval_episodes=3,
         deterministic=True,
@@ -807,27 +837,33 @@ def train() -> None:
         HardwareMonitorCallback(log_freq=20_000),
         CheckpointCallback(
             save_freq=100_000 // GOLD_N_ENVS,
-            save_path=str(MODEL_DIR / "checkpoints"),
-            name_prefix="ppo_satellite",
+            save_path=str(seed_model_dir / "checkpoints"),
+            name_prefix=f"ppo_seed{seed}",
             save_replay_buffer=False,
             verbose=1,
         ),
-        SaveVecNormalizeCallback(save_freq=100_000 // GOLD_N_ENVS),
+        SaveVecNormalizeCallback(
+            save_freq=100_000 // GOLD_N_ENVS,
+            save_path=vec_norm_path,
+        ),
         MarkdownTrackerCallback(
             update_freq=20_000,
             total_timesteps=GOLD_TOTAL_STEPS,
             eval_cb=eval_callback,
             n_eval_episodes=5,
             hyperparams=hp_table,
+            log_path=md_log_path,
         ),
     ])
 
-    print(f"  💾 Checkpoints  → {MODEL_DIR / 'checkpoints'}")
-    print(f"  💾 VecNormalize → {VEC_NORM_PATH}")
-    print(f"  📋 Training log → {MD_LOG}")
+    print(f"  💾 Best model    → {seed_model_dir}/best_model.zip")
+    print(f"  💾 Checkpoints   → {seed_model_dir / 'checkpoints'}")
+    print(f"  💾 VecNormalize  → {vec_norm_path}")
+    print(f"  📋 Training log  → {md_log_path}")
+    print(f"  📊 TensorBoard   → {seed_log_dir}")
     print()
     print("─" * 72)
-    print(f"  🏆 GOLD RUN: {GOLD_TOTAL_STEPS:,} timesteps")
+    print(f"  🚀 SEED {seed}: {GOLD_TOTAL_STEPS:,} timesteps — training started")
     print("─" * 72)
 
     t0        = time.perf_counter()
@@ -839,53 +875,145 @@ def train() -> None:
         model.learn(
             total_timesteps=GOLD_TOTAL_STEPS,
             callback=callbacks,
-            tb_log_name="ppo_phase3_6",
+            tb_log_name=f"ppo_seed{seed}",
         )
         completed = True
     except KeyboardInterrupt:
-        print("\n  ⚠  KeyboardInterrupt — saving partial checkpoint …")
-        partial_path = MODEL_DIR / "partial_model"
+        print(f"\n  ⚠  KeyboardInterrupt — saving partial checkpoint for seed {seed} …")
+        partial_path = seed_model_dir / "partial_model"
         model.save(str(partial_path))
-        train_env.save(str(VEC_NORM_PATH))
+        train_env.save(str(vec_norm_path))
         print(f"  ✓ Partial model     → {partial_path}.zip")
-        print(f"  ✓ VecNormalize      → {VEC_NORM_PATH}")
+        print(f"  ✓ VecNormalize      → {vec_norm_path}")
+        raise  # re-raise so the outer loop stops cleanly
     finally:
         elapsed = time.perf_counter() - t0
         avg_fps = max(model.num_timesteps, 1) / max(elapsed, 1e-9)
         status  = "complete" if completed else "interrupted"
-        print(f"\n  Training {status} — {elapsed:.1f} s  ({avg_fps:,.0f} steps/s)")
+        print(f"\n  Seed {seed} training {status} — {elapsed:.1f} s  ({avg_fps:,.0f} steps/s)")
         print(f"  Timesteps completed: {model.num_timesteps:,} / {GOLD_TOTAL_STEPS:,}")
         sys.stdout.flush()
 
     if completed:
-        final_path = MODEL_DIR / "stability_ppo_m4"
+        final_path = seed_model_dir / f"stability_ppo_seed{seed}"
         model.save(str(final_path))
-        train_env.save(str(VEC_NORM_PATH))
+        train_env.save(str(vec_norm_path))
         print(f"  ✓ Final model       → {final_path}.zip")
-        print(f"  ✓ VecNormalize      → {VEC_NORM_PATH}\n")
+        print(f"  ✓ VecNormalize      → {vec_norm_path}\n")
 
-        results  = evaluate(model, vec_norm_path=VEC_NORM_PATH, n_episodes=5)
+        results     = evaluate(model, vec_norm_path=vec_norm_path, n_episodes=5, traj_path=traj_path)
         std_metrics = compute_standardized_metrics(results)
         results["standardized"] = std_metrics
 
-        # retrieve md_callback from callbacks list
         md_cb = next(
             cb for cb in callbacks.callbacks
             if isinstance(cb, MarkdownTrackerCallback)
         )
         md_cb.finalize(results)
-        print(f"  📝 Training log finalized → {MD_LOG}")
+        print(f"  📝 Training log finalized → {md_log_path}")
 
         ru = resource.getrusage(resource.RUSAGE_SELF)
-        print(f"\n  Final Hardware State")
+        print(f"\n  Hardware State (seed {seed})")
         print(f"    Peak RSS       : {ru.ru_maxrss / (1024*1024):.1f} MB")
         print(f"    Training FPS   : {avg_fps:,.0f} steps/s")
         print(f"    Wall-clock     : {elapsed:.1f} s  ({elapsed/60:.1f} min)")
         print(f"    Finished       : {time.strftime('%Y-%m-%d %H:%M:%S')}")
         print()
 
+    # ── Memory cleanup — release all env/model references before next seed ────
     train_env.close()
     eval_env.close()
+    del model, train_env, eval_env, raw_vec, eval_dummy, eval_raw
+    gc.collect()
+    print(f"  🧹 Memory cleared after seed {seed} — ready for next iteration.\n")
+
+
+def train() -> None:
+    """
+    Multi-seed PPO training pipeline.
+
+    Iterates over TRAINING_SEEDS = [42, 101, 202, 303, 404], calling
+    _train_single_seed() for each.  Each seed gets its own output directory
+    under models/phase3.6_run/seed_<N>/ and logs/phase3.6_run/seed_<N>/.
+
+    caffeinate is launched once with -w <PID> so it is tied to *this* script's
+    PID and exits automatically whether the script ends cleanly or crashes —
+    no manual cleanup required.  An atexit handler is also registered as a
+    belt-and-suspenders fallback.
+    """
+    # ── macOS sleep prevention — tied to this script's PID ───────────────────
+    # -d  : prevent display sleep
+    # -i  : prevent idle sleep
+    # -w <PID> : exit caffeinate automatically when this script's PID exits
+    _caff = subprocess.Popen(
+        ["caffeinate", "-di", "-w", str(os.getpid())],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    atexit.register(lambda: _caff.poll() is None and _caff.terminate())
+    print(f"  ☕ caffeinate started (PID {_caff.pid}, watching script PID {os.getpid()})")
+
+    tee = TeeLogger(LOG_FILE)
+    sys.stdout = tee   # type: ignore[assignment]
+    sys.stderr = tee   # type: ignore[assignment]
+
+    DIVIDER = "=" * 72
+    print(DIVIDER)
+    print("  Phase 3 — PPO Agent Training  (3M Steps · Multi-Seed Run)")
+    print(f"  Script    : phase3_train_agent.py")
+    print(f"  Started   : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Dataset   : {TOPOLOGY_PATH.name}")
+    print(f"  ETA_S     : {GOLD_ETA_S} (baseline)")
+    print(f"  Device    : {GOLD_DEVICE} (hardcoded)")
+    print(f"  n_envs    : {GOLD_N_ENVS} (SubprocVecEnv → ~1448 FPS)")
+    print(f"  Seeds     : {TRAINING_SEEDS}")
+    print(f"  Total runs: {len(TRAINING_SEEDS)}")
+    print(f"  Next step : phase3_finetune_agent.py (ETA_S=2.0, 500k steps)")
+    print(DIVIDER)
+
+    validate_hardware()
+    _patch_eta_s()
+
+    # ── Pre-build topology cache ───────────────────────────────────────────────
+    # Load the topology once in the main process.  _load_topology() writes the
+    # decompressed arrays to data/.topology_cache/ as uncompressed .npy files.
+    # Every SubprocVecEnv worker (spawn) then reads from the cache in ~1 s
+    # instead of decompressing the NPZ from scratch (~14 min each).
+    print("  🗄  Pre-building topology cache (runs once, workers will use fast path) …")
+    _cache_env = _make_single_env(seed=0)
+    _cache_env.close()
+    del _cache_env
+    print("  ✅ Topology cache ready — SubprocVecEnv workers will load in ~1 s\n")
+
+    wall_start      = time.perf_counter()
+    completed_seeds: list[int] = []
+
+    for i, seed in enumerate(TRAINING_SEEDS):
+        print()
+        print("=" * 72)
+        print(f"  RUN {i + 1}/{len(TRAINING_SEEDS)} — Seed {seed}")
+        print("=" * 72)
+        try:
+            _train_single_seed(seed)
+            completed_seeds.append(seed)
+        except KeyboardInterrupt:
+            print(f"\n  ⚠  KeyboardInterrupt — stopping multi-seed loop after seed {seed}.")
+            break
+        except Exception as exc:
+            import traceback
+            print(f"\n  ❌ Seed {seed} failed with: {exc}")
+            traceback.print_exc()
+            print("     Continuing to next seed …\n")
+
+    total_elapsed = time.perf_counter() - wall_start
+    print()
+    print("=" * 72)
+    print(f"  ✅ Multi-seed run complete — {total_elapsed:.1f} s ({total_elapsed / 3600:.2f} h)")
+    print(f"  Seeds completed : {completed_seeds}")
+    print(f"  Outputs         : {MODEL_DIR}")
+    print("=" * 72)
+    print()
+
     _caff.terminate()
     print("  ☕ caffeinate terminated — system sleep re-enabled")
 
