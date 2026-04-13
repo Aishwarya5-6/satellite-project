@@ -980,7 +980,7 @@ def train() -> None:
     # Every SubprocVecEnv worker (spawn) then reads from the cache in ~1 s
     # instead of decompressing the NPZ from scratch (~14 min each).
     print("  🗄  Pre-building topology cache (runs once, workers will use fast path) …")
-    _cache_env = _make_single_env(seed=0)
+    _cache_env = _make_single_env(sat_id=0, seed=0)
     _cache_env.close()
     del _cache_env
     print("  ✅ Topology cache ready — SubprocVecEnv workers will load in ~1 s\n")
